@@ -37,7 +37,7 @@ INDEX_PAT = re.compile(r'Index of /.git', re.IGNORECASE)
 GIT_HEAD_PAT = re.compile(r'ref:\s+refs/', re.IGNORECASE)
 GIT_CONFIG_PAT = re.compile(r'\[core\]', re.IGNORECASE)
 
-ANSI_RED = "\033[31m"
+ANSI_RED = "\033[91m"  # Bright red
 ANSI_GREEN = "\033[92m"
 ANSI_RESET = "\033[0m"
 

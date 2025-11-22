@@ -4,11 +4,11 @@ repoXpose.py — parallel .git exposure scanner (camelCase + state resume + colo
 
 Features:
  - camelCase naming
- - thread-safe .state file for resuming progress (format: STATUS,STATUS_CODE_OR_MSG,URL)
- - prints only VULNERABLE / MAYBE VULNERABLE lines (colorized)
+ - thread-safe .state file with timestamp for resuming progress (format: STATUS,STATUS_CODE_OR_MSG,URL)
+ - prints only VULNERABLE / SUSPICIOUS lines (colorized)
  - simple remaining counter with print(..., end='\r', flush=True)
  - graceful handling of KeyboardInterrupt and thread exceptions
- - writes final CSV report named: DD-Mmm-YYYY-RepoXpose.csv (uses 'Sept' for September)
+ - optional CSV report named: DD-Mmm-YYYY-RepoXpose.csv (uses 'Sept' for September)
 """
 
 from __future__ import annotations
@@ -29,7 +29,7 @@ from requests.adapters import HTTPAdapter, Retry # type: ignore
 # Config / constants
 # -------------------------
 VULN = "VULNERABLE"
-MAYBE = "MAYBE VULNERABLE"
+SUSPICIOUS = "SUSPICIOUS"
 OK = "OK"
 ERROR = "ERROR"
 
@@ -43,7 +43,7 @@ ANSI_RESET = "\033[0m"
 
 DEFAULT_THREADS = 50
 DEFAULT_TIMEOUT = 5.0
-DEFAULT_STATE_FILE = ".state"
+DEFAULT_STATE_FILE = None  # Will be generated with timestamp
 
 # month mapping with 'Sept' for September to match your example
 MONTH_MAP = {
@@ -117,7 +117,7 @@ def loadState(stateFile: str) -> None:
                     continue
                 status, codeOrMsg, url = parts[0].strip(), parts[1].strip(), parts[2].strip()
                 processedUrls.add(url)
-                if status.upper() in (VULN, MAYBE):
+                if status.upper() in (VULN, SUSPICIOUS):
                     vulnResults.append((status.upper(), codeOrMsg, url))
     except Exception as e:
         print(f"[WARN] Failed to read state file {stateFile}: {e}", file=sys.stderr)
@@ -133,7 +133,7 @@ def appendState(stateFile: str, status: str, codeOrMsg: str, url: str) -> None:
             with open(stateFile, "a", encoding="utf-8") as fh:
                 fh.write(f"{status},{codeOrMsg},{url}\n")
             processedUrls.add(url)
-            if status.upper() in (VULN, MAYBE):
+            if status.upper() in (VULN, SUSPICIOUS):
                 vulnResults.append((status.upper(), codeOrMsg, url))
     except Exception as e:
         # we must not crash on state write failure
@@ -146,6 +146,7 @@ def appendState(stateFile: str, status: str, codeOrMsg: str, url: str) -> None:
 def checkGitExposure(session: requests.Session, baseUrl: str, timeout: float) -> Optional[Tuple[str, str, str]]:
     """
     Probe git endpoints. Return (STATUS_LABEL, STATUS_CODE_OR_MSG, baseUrl) or None.
+    Returns VULNERABLE for confirmed exposure, SUSPICIOUS for 200 with ambiguous content.
     """
     try:
         # /.git/ directory listing
@@ -162,8 +163,9 @@ def checkGitExposure(session: requests.Session, baseUrl: str, timeout: float) ->
             body = r2.text.strip()
             if GIT_HEAD_PAT.search(body):
                 return (VULN, str(r2.status_code), baseUrl)
+            # Only mark as SUSPICIOUS if we got 200 with suspicious SHA-like content (but not confirmed)
             if len(body) > 0 and re.search(r'[a-f0-9]{4,40}', body, re.IGNORECASE):
-                return (MAYBE, str(r2.status_code), baseUrl)
+                return (SUSPICIOUS, str(r2.status_code), baseUrl)
 
         # /.git/config
         urlConfig = baseUrl + "/.git/config"
@@ -174,21 +176,10 @@ def checkGitExposure(session: requests.Session, baseUrl: str, timeout: float) ->
         # objects/info/packs or objects/pack/
         for p in ("/.git/objects/info/packs", "/.git/objects/pack/"):
             rp = session.get(baseUrl + p, timeout=timeout, allow_redirects=True)
+            # Only check for suspicious content if we got 200 OK
             if rp.status_code == 200:
                 if "pack-" in (rp.text or "") or (rp.headers.get("Content-Type", "").startswith("text")):
-                    return (MAYBE, str(rp.status_code), baseUrl)
-
-        # 401/403 on endpoints -> maybe
-        codes = [getattr(r, "status_code", None), getattr(r2, "status_code", None), getattr(r3, "status_code", None)]
-        if any(c in (401, 403) for c in codes if isinstance(c, int)):
-            return (MAYBE, "401/403", baseUrl)
-
-        # redirects with .git in location
-        for resp in (r, r2, r3):
-            if resp is not None and getattr(resp, "status_code", None) in (301, 302):
-                loc = resp.headers.get("Location", "")
-                if ".git" in loc:
-                    return (MAYBE, f"redirect:{loc}", baseUrl)
+                    return (SUSPICIOUS, str(rp.status_code), baseUrl)
 
     except requests.RequestException as e:
         # network error - record as ERROR with message
@@ -215,18 +206,18 @@ def worker(taskUrl: str, session: requests.Session, timeout: float, stateFile: s
 
         result = checkGitExposure(session, taskUrl, timeout)
         if result is None:
-            # mark as ERROR
-            appendState(stateFile, ERROR, "no-response", taskUrl)
+            # Don't record ERROR status
+            pass
         else:
             status, codeOrMsg, url = result
-            appendState(stateFile, status, codeOrMsg, url)
-            # Only print vulnerable / maybe vulnerable
-            if status == VULN:
-                print(" " * 160, end='\r')  # clear single-line counter
-                print(f"{ANSI_RED}[{status}]{ANSI_RESET} {url} -- {codeOrMsg}")
-            elif status == MAYBE:
-                print(" " * 160, end='\r')
-                print(f"{ANSI_GREEN}[{status}]{ANSI_RESET} {url} -- {codeOrMsg}")
+            # Only record VULNERABLE or SUSPICIOUS
+            if status in (VULN, SUSPICIOUS):
+                appendState(stateFile, status, codeOrMsg, url)
+                # Print the results
+                if status == VULN:
+                    print(f"{ANSI_RED}[{status}]{ANSI_RESET} {url}")
+                elif status == SUSPICIOUS:
+                    print(f"{ANSI_GREEN}[{status}]{ANSI_RESET} {url}")
         # decrement counter
         with remainingLock:
             remaining -= 1
@@ -265,7 +256,7 @@ def loadTargetsFromFile(path: str) -> List[str]:
     return lst
 
 
-def writeFinalCsv(outPrefix: str = "RepoXpose") -> None:
+def writeFinalCsv(stateFile: str, outPrefix: str = "RepoXpose") -> None:
     """
     Writes the vulnResults + ALL entries from state (processedUrls tracked separately)
     into a CSV named like: DD-Mmm-YYYY-RepoXpose.csv
@@ -277,7 +268,6 @@ def writeFinalCsv(outPrefix: str = "RepoXpose") -> None:
         year = today.year
         filename = f"{day}-{month}-{year}-{outPrefix}.csv"
         # Read the .state file to include all entries in the same order
-        stateFile = DEFAULT_STATE_FILE
         lines = []
         if os.path.exists(stateFile):
             with open(stateFile, "r", encoding="utf-8", errors="ignore") as fh:
@@ -311,12 +301,19 @@ def main(argv: Optional[List[str]] = None) -> int:
     parser.add_argument("-u", "--url", help="Single target URL", type=str)
     parser.add_argument("-t", "--threads", help=f"Number of parallel workers (default: {DEFAULT_THREADS})", type=int, default=DEFAULT_THREADS)
     parser.add_argument("-T", "--timeout", help=f"Request timeout seconds (default: {DEFAULT_TIMEOUT})", type=float, default=DEFAULT_TIMEOUT)
-    parser.add_argument("--state-file", help=f"State file to resume from (default: {DEFAULT_STATE_FILE})", type=str, default=DEFAULT_STATE_FILE)
+    parser.add_argument("--state-file", help="State file to resume from (default: auto-generated with timestamp)", type=str, default=None)
     parser.add_argument("--max", help="Max targets to process from input file (for testing)", type=int, default=0)
+    parser.add_argument("--csv", help="Generate CSV report after scan completes", action="store_true")
     args = parser.parse_args(argv)
 
     if not args.input and not args.url:
         parser.error("Specify --input FILE or --url URL")
+
+    # Generate state file name with timestamp if not provided
+    if args.state_file is None:
+        now = datetime.now()
+        timestamp = now.strftime("%Y%m%d_%H%M%S")
+        args.state_file = f".state_{timestamp}"
 
     # load state if present
     try:
@@ -348,8 +345,9 @@ def main(argv: Optional[List[str]] = None) -> int:
 
     if totalTargets == 0:
         print("No remaining targets to process (state file indicates all done).")
-        # still write final CSV from state
-        writeFinalCsv()
+        # write final CSV from state if flag is set
+        if args.csv:
+            writeFinalCsv(args.state_file)
         return 0
 
     session = makeSession(timeout=int(args.timeout), maxRetries=1, poolConnections=args.threads+10, poolMaxSize=args.threads+10)
@@ -363,33 +361,24 @@ def main(argv: Optional[List[str]] = None) -> int:
 
     # run thread pool
     executor = concurrent.futures.ThreadPoolExecutor(max_workers=args.threads)
-    futures = []
+    futures = set()  # Use set for O(1) removal
     try:
         for url in toProcess:
-            futures.append(executor.submit(worker, url, session, args.timeout, args.state_file))
+            futures.add(executor.submit(worker, url, session, args.timeout, args.state_file))
 
         # Monitor completion and print remaining
         while futures:
-            done, notDone = concurrent.futures.wait(futures, timeout=0.5, return_when=concurrent.futures.FIRST_COMPLETED)
-            # remove done from futures list
-            for f in done:
-                futures.remove(f)
-                # check for exception
-                try:
-                    exc = f.exception(timeout=0)
-                    if exc:
-                        # exceptions should already be handled in worker, but log if any leaked
-                        print(f"\n[WARN] Worker raised: {exc}", file=sys.stderr)
-                except concurrent.futures.TimeoutError:
-                    pass
-            printRemaining()
-        # wait for any remaining just in case
-        executor.shutdown(wait=True)
+            done, futures = concurrent.futures.wait(futures, timeout=0.5, return_when=concurrent.futures.FIRST_COMPLETED)
+            # Just print remaining, no need to check exceptions (worker handles them)
+            if done:
+                printRemaining()
+        # No need for shutdown(wait=True) since all futures are already done
     except KeyboardInterrupt:
         print("\n[INFO] Keyboard interrupt received — saving progress and exiting gracefully...")
         executor.shutdown(wait=False, cancel_futures=True)
         # ensure state flushed (already appendState writes instantly)
-        writeFinalCsv()
+        if args.csv:
+            writeFinalCsv(args.state_file)
         return 1
     except Exception as e:
         print(f"\n[ERROR] Fatal exception in main thread: {e}", file=sys.stderr)
@@ -397,14 +386,16 @@ def main(argv: Optional[List[str]] = None) -> int:
             executor.shutdown(wait=False, cancel_futures=True)
         except Exception:
             pass
-        writeFinalCsv()
+        if args.csv:
+            writeFinalCsv(args.state_file)
         return 2
 
     # finalize
     # ensure final printed newline
     print("\nScan complete.")
-    # write final CSV
-    writeFinalCsv()
+    # write final CSV if flag is set
+    if args.csv:
+        writeFinalCsv(args.state_file)
     return 0
 
 
@@ -416,9 +407,6 @@ if __name__ == "__main__":
         raise
     except Exception as e:
         print(f"[FATAL] Unhandled exception: {e}", file=sys.stderr)
-        # best effort: write csv if possible
-        try:
-            writeFinalCsv()
-        except Exception:
-            pass
         raise
+    except KeyboardInterrupt:
+        pass

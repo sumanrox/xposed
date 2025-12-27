@@ -24,6 +24,11 @@ from datetime import datetime
 from typing import List, Optional, Tuple, Set
 import requests # type: ignore
 from requests.adapters import HTTPAdapter, Retry # type: ignore
+try:
+    import modules.dumper
+except ImportError:
+    # If running directly not as module, or path issues
+    pass
 
 # -------------------------
 # Config / constants
@@ -143,91 +148,204 @@ def appendState(stateFile: str, status: str, codeOrMsg: str, url: str) -> None:
 # -------------------------
 # Scanner logic
 # -------------------------
-def checkGitExposure(session: requests.Session, baseUrl: str, timeout: float) -> Optional[Tuple[str, str, str]]:
+def checkGitExposure(session: requests.Session, baseUrl: str, timeout: float) -> Optional[Tuple[str, str, str, str]]:
     """
-    Probe git endpoints. Return (STATUS_LABEL, STATUS_CODE_OR_MSG, baseUrl) or None.
+    Probe git endpoints. Return (STATUS_LABEL, STATUS_CODE_OR_MSG, baseUrl, serverHeader) or None.
     Returns VULNERABLE for confirmed exposure, SUSPICIOUS for 200 with ambiguous content.
     """
+    serverHeader = "N/A"
     try:
         # /.git/ directory listing
         urlGitDir = baseUrl + "/.git/"
         r = session.get(urlGitDir, timeout=timeout, allow_redirects=True)
+        serverHeader = r.headers.get("Server", "N/A")
         text = r.text or ""
         if r.status_code == 200 and INDEX_PAT.search(text):
-            return (VULN, str(r.status_code), baseUrl)
+            return (VULN, str(r.status_code), baseUrl, serverHeader)
 
         # /.git/HEAD
         urlHead = baseUrl + "/.git/HEAD"
         r2 = session.get(urlHead, timeout=timeout, allow_redirects=True)
+        if serverHeader == "N/A": serverHeader = r2.headers.get("Server", "N/A")
         if r2.status_code == 200:
             body = r2.text.strip()
             if GIT_HEAD_PAT.search(body):
-                return (VULN, str(r2.status_code), baseUrl)
+                return (VULN, str(r2.status_code), baseUrl, serverHeader)
             # Only mark as SUSPICIOUS if we got 200 with suspicious SHA-like content (but not confirmed)
             if len(body) > 0 and re.search(r'[a-f0-9]{4,40}', body, re.IGNORECASE):
-                return (SUSPICIOUS, str(r2.status_code), baseUrl)
+                return (SUSPICIOUS, str(r2.status_code), baseUrl, serverHeader)
 
         # /.git/config
         urlConfig = baseUrl + "/.git/config"
         r3 = session.get(urlConfig, timeout=timeout, allow_redirects=True)
+        if serverHeader == "N/A": serverHeader = r3.headers.get("Server", "N/A")
         if r3.status_code == 200 and GIT_CONFIG_PAT.search(r3.text or ""):
-            return (VULN, str(r3.status_code), baseUrl)
+            return (VULN, str(r3.status_code), baseUrl, serverHeader)
 
         # objects/info/packs or objects/pack/
         for p in ("/.git/objects/info/packs", "/.git/objects/pack/"):
             rp = session.get(baseUrl + p, timeout=timeout, allow_redirects=True)
+            if serverHeader == "N/A": serverHeader = rp.headers.get("Server", "N/A")
             # Only check for suspicious content if we got 200 OK
             if rp.status_code == 200:
                 if "pack-" in (rp.text or "") or (rp.headers.get("Content-Type", "").startswith("text")):
-                    return (SUSPICIOUS, str(rp.status_code), baseUrl)
+                    return (SUSPICIOUS, str(rp.status_code), baseUrl, serverHeader)
 
     except requests.RequestException as e:
         # network error - record as ERROR with message
-        return (ERROR, str(e), baseUrl)
+        return (ERROR, str(e), baseUrl, "Error")
     except Exception as e:
-        return (ERROR, str(e), baseUrl)
+        return (ERROR, str(e), baseUrl, "Error")
 
     # not vulnerable / nothing conclusive
-    return (OK, str(getattr(r, "status_code", "N/A")), baseUrl)
+    return (OK, str(getattr(r, "status_code", "N/A")), baseUrl, serverHeader)
 
 
-def worker(taskUrl: str, session: requests.Session, timeout: float, stateFile: str) -> None:
+def worker(taskUrl: str, session: requests.Session, timeout: float, stateFile: str, dumpingExecutor: Optional[concurrent.futures.ThreadPoolExecutor] = None, outputDirArg: Optional[str] = None, progress: Optional[object] = None, scanTaskID: Optional[object] = None, findingsTable: Optional[object] = None, tableLock: Optional[object] = None) -> None:
     """
     Worker that runs checkGitExposure and appends to state. Handles exceptions.
+    Trigger dump if vulnerable and dumpingExecutor is provided.
     """
     global remaining, lastChecked
+    # Late import to ensure it's available or assume top-level import
+    from rich.panel import Panel
+    
     try:
         # If already processed (from state resume), skip
         if taskUrl in processedUrls:
             with remainingLock:
                 remaining -= 1
                 lastChecked = taskUrl
+            if progress and scanTaskID is not None:
+                progress.advance(scanTaskID, 1)
             return
 
         result = checkGitExposure(session, taskUrl, timeout)
+    except KeyboardInterrupt:
+        import os
+        os._exit(1) # Worker exit
+        return
+    except Exception:
+        pass
+
+    try:
         if result is None:
-            # Don't record ERROR status
             pass
         else:
-            status, codeOrMsg, url = result
-            # Only record VULNERABLE or SUSPICIOUS
+            status, codeOrMsg, url, serverHeader = result
             if status in (VULN, SUSPICIOUS):
                 appendState(stateFile, status, codeOrMsg, url)
-                # Print the results
                 if status == VULN:
-                    print(f"{ANSI_RED}[{status}]{ANSI_RESET} {url}")
+                    timeStr = datetime.now().strftime("%H:%M:%S")
+                    if dumpingExecutor:
+                         # Add row to table
+                         if findingsTable and tableLock:
+                             with tableLock:
+                                 findingsTable.add_row(
+                                     f"[bold red]{status}[/bold red]", 
+                                     url, 
+                                     f"[magenta]{serverHeader}[/magenta]",
+                                     f"[dim white]{timeStr}[/dim white]",
+                                     "[cyan]Dumping...[/cyan]"
+                                 )
+                         else:
+                            print(f"[VULNERABLE] {url} [Server: {serverHeader}] [DUMPING]")
+
+                         try:
+                            # Determine output directory
+                            parsed = urllib.parse.urlparse(url)
+                            domain = parsed.netloc.replace(':', '_')
+                            if not domain:
+                                domain = "unknown_target"
+                            
+                            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+                            defaultName = f"{domain}-xposed-{timestamp}"
+                            finalOutputDir = outputDirArg if outputDirArg else defaultName
+                            
+                            dumpUrl = url
+                            if not dumpUrl.endswith("/.git/"):
+                                dumpUrl = dumpUrl.rstrip("/")
+                                if not dumpUrl.endswith("/.git"):
+                                    dumpUrl += "/.git/"
+                            
+                            # Define a wrapper to handle the dump
+                            def runDump():
+                                taskID = None
+                                try:
+                                    if progress:
+                                        taskID = progress.add_task(f"[cyan]Dumping {domain}...", total=None)
+
+                                    def progressCallback(completed, total, currentFile):
+                                        if progress and taskID is not None:
+                                            progress.update(taskID, completed=completed, total=total if total > 0 else None)
+
+                                    commitCount = modules.dumper.dumpAndExtract(dumpUrl, finalOutputDir, progressCallback=progressCallback)
+                                    
+                                    if progress and taskID is not None:
+                                        # Keep it green on success
+                                        if isinstance(commitCount, int) and commitCount > 0:
+                                            statsMsg = f"({commitCount} commits)"
+                                        else:
+                                            statsMsg = ""
+                                        progress.update(taskID, completed=100, total=100, description=f"[green]Dumped {domain} ✓ {statsMsg}")
+                                        
+                                except KeyboardInterrupt:
+                                    if progress and taskID is not None:
+                                        progress.update(taskID, description=f"[yellow]Stopped {domain}")
+                                except Exception as e:
+                                    if progress and taskID is not None:
+                                        progress.update(taskID, description=f"[red]Failed {domain}: {str(e)}")
+                                        # progress.console.print(f"[red][FAIL] {url} ({str(e)})") # Optional to reduce noise
+
+                            dumpingExecutor.submit(runDump)
+                            
+                         except Exception as dumpErr:
+                             err_msg = f"[red][ERROR] Failed to queue dump for {url}: {dumpErr}[/red]"
+                             if progress:
+                                 progress.console.print(err_msg)
+                             else:
+                                 print(err_msg, file=sys.stderr)
+                    else:
+                        # No dumping, just alert
+                        if findingsTable and tableLock:
+                             with tableLock:
+                                 findingsTable.add_row(
+                                     f"[bold red]{status}[/bold red]", 
+                                     url, 
+                                     f"[magenta]{serverHeader}[/magenta]",
+                                     f"[dim white]{timeStr}[/dim white]",
+                                     "[yellow]Logged[/yellow]"
+                                 )
+                        else:
+                             print(f"{ANSI_RED}[{status}]{ANSI_RESET} {url}")
+
                 elif status == SUSPICIOUS:
-                    print(f"{ANSI_GREEN}[{status}]{ANSI_RESET} {url}")
-        # decrement counter
+                    if findingsTable and tableLock:
+                         with tableLock:
+                             findingsTable.add_row(f"[bold yellow]{status}[/bold yellow]", url, f"[grey50]Status: {codeOrMsg}[/grey50]")
+                    else:
+                        print(f"{ANSI_GREEN}[{status}]{ANSI_RESET} {url}")
+        
         with remainingLock:
             remaining -= 1
             lastChecked = taskUrl
+            
+        # Update main scan progress
+        if progress and scanTaskID is not None:
+            progress.advance(scanTaskID, 1)
+            
+    except KeyboardInterrupt:
+        import os
+        os._exit(1)
     except Exception as e:
-        # Make sure unexpected exceptions do not kill the whole program
+        # Error handling
         appendState(stateFile, ERROR, str(e), taskUrl)
         with remainingLock:
             remaining -= 1
             lastChecked = taskUrl
+        # Update main scan progress even on error
+        if progress and scanTaskID is not None:
+            progress.advance(scanTaskID, 1)
 
 
 def printRemaining() -> None:
@@ -304,6 +422,8 @@ def main(argv: Optional[List[str]] = None) -> int:
     parser.add_argument("--state-file", help="State file to resume from (default: auto-generated with timestamp)", type=str, default=None)
     parser.add_argument("--max", help="Max targets to process from input file (for testing)", type=int, default=0)
     parser.add_argument("--csv", help="Generate CSV report after scan completes", action="store_true")
+    parser.add_argument("--dump", help="Automatically dump and recover artifacts from vulnerable targets", action="store_true")
+    parser.add_argument("--output-dir", help="Output directory for dump (default: domain-xposed-datetime)", type=str)
     args = parser.parse_args(argv)
 
     if not args.input and not args.url:
@@ -360,40 +480,126 @@ def main(argv: Optional[List[str]] = None) -> int:
         pass
 
     # run thread pool
-    executor = concurrent.futures.ThreadPoolExecutor(max_workers=args.threads)
-    futures = set()  # Use set for O(1) removal
-    try:
-        for url in toProcess:
-            futures.add(executor.submit(worker, url, session, args.timeout, args.state_file))
+    # Create a Rich Progress manager
+    from rich.progress import Progress, SpinnerColumn, BarColumn, TextColumn, TimeRemainingColumn, TransferSpeedColumn, MofNCompleteColumn
+    from rich.console import Console
+    from rich.panel import Panel
+    from rich.table import Table
+    from rich.live import Live
+    from rich.console import Group
+    from rich.box import HEAVY_EDGE
+    
+    # 1. Create the Findings Table
+    findingsTable = Table(
+        box=HEAVY_EDGE, 
+        show_header=True, 
+        header_style="bold white on blue", 
+        title="[bold reverse cyan] TARGET EXPOSURE SYSTEMS [/bold reverse cyan]",
+        # title_style="bold cyan", # Title style is handled in the text itself for reverse effect
+        expand=True,
+        border_style="bright_blue",
+        row_styles=["", "dim"]
+    )
+    findingsTable.add_column("STATUS", justify="center", width=12, style="bold")
+    findingsTable.add_column("TARGET URL", style="cyan")
+    findingsTable.add_column("SERVER", style="magenta")
+    findingsTable.add_column("TIME", style="dim white")
+    findingsTable.add_column("ACTION", style="grey70")
+    
+    # Lock for table updates
+    tableLock = threading.Lock()
 
-        # Monitor completion and print remaining
-        while futures:
-            done, futures = concurrent.futures.wait(futures, timeout=0.5, return_when=concurrent.futures.FIRST_COMPLETED)
-            # Just print remaining, no need to check exceptions (worker handles them)
-            if done:
-                printRemaining()
-        # No need for shutdown(wait=True) since all futures are already done
-    except KeyboardInterrupt:
-        print("\n[INFO] Keyboard interrupt received — saving progress and exiting gracefully...")
-        executor.shutdown(wait=False, cancel_futures=True)
-        # ensure state flushed (already appendState writes instantly)
-        if args.csv:
-            writeFinalCsv(args.state_file)
-        return 1
-    except Exception as e:
-        print(f"\n[ERROR] Fatal exception in main thread: {e}", file=sys.stderr)
+    # 2. Create Progress Bar
+    progress = Progress(
+        SpinnerColumn(spinner_name="dots12", style="bold cyan"),
+        TextColumn("[progress.description]{task.description}"),
+        BarColumn(bar_width=None, complete_style="cyan", finished_style="green"),
+        TextColumn("[progress.percentage]{task.percentage:>3.0f}%"),
+        MofNCompleteColumn(),
+        TimeRemainingColumn(),
+        refresh_per_second=10
+    )
+
+    # 3. Create Group and Live View
+    ui_group = Group(
+        Panel(findingsTable, border_style="cyan"),
+        progress
+    )
+
+    # Wrap execution in Live context
+    # Note: We pass the table and lock to the worker
+    with Live(ui_group, refresh_per_second=10, screen=False) as live:
+        
+        # Create the Overall Scan Progress bar
+        scanTaskID = progress.add_task("[bold white]Scanning Targets[/bold white]", total=totalTargets)
+        
+        executor = concurrent.futures.ThreadPoolExecutor(max_workers=args.threads)
+        
+        dumpingExecutor = None
+        if args.dump:
+            dumpingExecutor = concurrent.futures.ThreadPoolExecutor(max_workers=args.threads)
+
+        futures = set()
         try:
-            executor.shutdown(wait=False, cancel_futures=True)
-        except Exception:
-            pass
-        if args.csv:
-            writeFinalCsv(args.state_file)
-        return 2
+            for url in toProcess:
+                futures.add(executor.submit(
+                    worker, 
+                    url, 
+                    session, 
+                    args.timeout, 
+                    args.state_file, 
+                    dumpingExecutor, 
+                    args.output_dir,
+                    progress,      # Rich progress object
+                    scanTaskID,    # Task ID to advance
+                    findingsTable, # Pass table
+                    tableLock      # Pass lock
+                ))
 
-    # finalize
-    # ensure final printed newline
+            # Monitor completion
+            while futures:
+                done, futures = concurrent.futures.wait(futures, timeout=0.5, return_when=concurrent.futures.FIRST_COMPLETED)
+                # progress is updated inside worker via scanTaskID
+                
+            if args.dump and dumpingExecutor:
+                # We can print to console, but it might jump around with Live view. 
+                # Better to use a transient task or just let it finish.
+                pass
+
+            # Clean shutdown (non-interrupt case)
+            if args.dump and dumpingExecutor:
+                dumpingExecutor.shutdown(wait=True)
+            executor.shutdown(wait=True)
+                
+        except KeyboardInterrupt:
+            # FORCE EXIT to prevent traceback spam from threading shutdown
+            try:
+                 live.stop()
+            except:
+                 pass
+            import os
+            from rich import print as rprint
+            rprint("\n[bold yellow]Keyboard Interrupt! Exiting immediately...[/bold yellow]")
+            os._exit(1)
+            
+        except Exception as e:
+            # Use progress console to print error cleanly
+            # But normally we just exit
+            try:
+                 live.stop()
+            except:
+                 pass
+            import os
+            from rich import print as rprint
+            rprint(f"[bold red]Fatal Error: {e}[/bold red]")
+            os._exit(2)
+
     print("\nScan complete.")
-    # write final CSV if flag is set
+    if args.csv:
+        writeFinalCsv(args.state_file)
+    return 0
+
+    print("\nScan complete.")
     if args.csv:
         writeFinalCsv(args.state_file)
     return 0

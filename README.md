@@ -1,215 +1,110 @@
 # xposedRepo.py
 
-🚨 **Parallel .git Exposure Scanner** (with resumable state + colored output)
+🚨 **Parallel .git Exposure Scanner & Dumper** (Military-Grade UI + Resumable State)
 
-`xposedRepo.py` is a Python tool that scans multiple targets in parallel for **exposed `.git` repositories** — a common but critical security misconfiguration.
-
-It supports resuming interrupted scans, colored output for quick results triage, error handling, and generates a final CSV report.
+`xposedRepo.py` is a high-performance tool that scans targets in parallel for **exposed `.git` repositories** and optionally **dumps** their contents. It features a "Hardcore Tech" dashboard with industrial aesthetics for real-time reconnaissance.
 
 ---
 
-## ✨ Features
+## ✨ Key Features
 
-* **Parallel scanning** with configurable threads (default: 50).
-* **Resumable state file** (`.state`) — progress is saved as it runs.
-* **Thread-safe logging** — each result is recorded immediately.
-* **Error handling & retries** — gracefully continues on failures.
-* **Colorized output**:
+### 🛡️ **Military-Grade Dashboard**
+*   **Industrial UI**: Heavy-duty tables with high-contrast headers (White on Blue).
+*   **Live Intel**: Real-time progress bars with "M of N" counters (e.g., `15/45`).
+*   **Recon Columns**: Instantly see critical intel:
+    *   **STATUS**: `VULNERABLE` (Red) / `SUSPICIOUS` (Yellow)
+    *   **SERVER**: `nginx`, `Apache`, `Cloudflare` (Magenta)
+    *   **TIME**: Discovery timestamp (Dim White)
+*   **Clean Exit**: Graceful shutdown on `Ctrl+C` without terminal artifacts.
 
-  * 🟥 **VULNERABLE**
-  * 🟩 **MAYBE VULNERABLE**
-* **Remaining counter** with live updates (lightweight, no progress bars).
-* **CSV reporting** — results are exported as `DD-Mmm-YYYY-xposedRepo.csv`
-  (e.g. `04-Oct-2025-xposedRepo.csv`).
-* **Custom month mapping** (`Sept` instead of `Sep`).
-* **KeyboardInterrupt safe** — exits gracefully and saves progress.
+### ⚡ **High-Performance Scanning**
+*   **Parallel Execution**: Scans hundreds of targets concurrently (default: 50 threads).
+*   **Resumable**: Progress is saved to `.state` file immediately. Restarting resumes where you left off.
+*   **Smart Detection**: Checks `/.git/`, `HEAD`, `config`, and Pack files for accurate validation.
+
+### 📦 **Auto-Dump Integration**
+*   **--dump**: Automatically triggers the standard `git-dumper` logic for vulnerable targets.
+*   **Artifact Recovery**: Extracts commits and objects to a local directory.
+*   **Commit Counting**: Displays the number of extracted commits (e.g., `Dumped target.com ✓ (120 commits)`).
 
 ---
 
 ## 📦 Installation
 
-1. Clone/download this repository.
-2. Ensure Python **3.7+** is installed.
-3. Install dependencies:
-
-```bash
-pip install -r requirements.txt
-```
-
-> Minimal dependencies:
->
-> * `requests`
+1.  **Clone the repository**:
+    ```bash
+    git clone https://github.com/your-repo/xposed.git
+    cd xposed
+    ```
+2.  **Install Dependencies**:
+    ```bash
+    pip3 install -r requirements.txt
+    ```
+    *   Requires `rich`, `requests`, `dulwich` (for dumper).
 
 ---
 
 ## 🚀 Usage
 
-### Single target scan
-
-```bash
-python3 xposedRepo.py -u example.com
-```
-
-### Multiple targets (from file)
-
+### 1. Basic Scan (Recon Only)
+Scan a list of targets and see the live dashboard.
 ```bash
 python3 xposedRepo.py -i targets.txt
 ```
 
-### Custom options
-
+### 2. Scan & Auto-Dump (Full Attack)
+Scan targets and automatically dump the source code of vulnerable ones.
 ```bash
-python3 xposedRepo.py -i targets.txt -t 100 -T 10 --state-file myscan.state
+python3 xposedRepo.py -i targets.txt --dump
 ```
+> **Note**: Dumps are saved to the current directory (or `--output-dir`) with a timestamped folder name.
 
-Options:
-
-* `-i / --input` → file of domains/URLs (one per line).
-* `-u / --url` → single target domain/URL.
-* `-t / --threads` → number of parallel workers (default: 50).
-* `-T / --timeout` → request timeout in seconds (default: 5).
-* `--state-file` → path to `.state` file (default: `.state`).
-* `--max` → limit number of targets (for testing/debugging).
-
----
-
-## 📂 Output
-
-### Console
-
-* Prints **only vulnerable / maybe vulnerable** results (colored).
-* Live counter for progress:
-
-  ```
-  Remaining: 37/100  Last checked: https://example.com
-  ```
-
-### State file
-
-* Stored in `.state` (or custom path).
-* Format:
-
-  ```
-  STATUS,CODE_OR_MESSAGE,URL
-  ```
-
-Example:
-
-```
-VULNERABLE,200,https://example.com
-OK,404,https://another.com
-ERROR,Timeout,https://slow.com
-```
-
-### Final CSV
-
-* Written at the end (or on interruption).
-* Named: `DD-Mmm-YYYY-xposedRepo.csv`
-
-Columns:
-
-* `status`
-* `code_or_message`
-* `url`
-
----
-
-## 🛠️ Detection Logic
-
-`xposedRepo.py` checks the following for each target:
-
-* `/.git/` → directory listing (`Index of /.git`).
-* `/.git/HEAD` → looks for `ref: refs/` or SHA-like strings.
-* `/.git/config` → looks for `[core]`.
-* `/.git/objects/info/packs` & `/.git/objects/pack/` → indicators of Git packs.
-* Status codes `401/403` → flagged as **MAYBE VULNERABLE**.
-* Redirects pointing to `.git`.
-
-Results:
-
-* 🟥 **VULNERABLE** → confirmed Git exposure.
-* 🟩 **MAYBE VULNERABLE** → suspicious, needs manual review.
-* ✅ **OK** → not vulnerable.
-* ❌ **ERROR** → request/connection issues.
-
----
-
-## 🔄 State & Resume
-
-* Progress is written **per target** into `.state`.
-* If the scan is interrupted, restarting with the same state file will **skip already processed URLs**.
-* Results are **always appended**, not overwritten.
-
----
-
-## ⚡ Examples
-
-### Resume an interrupted scan
-
+### 3. Single Target Dump
+Dump a specific target immediately.
 ```bash
-python3 xposedRepo.py -i biglist.txt --state-file .state
+python3 xposedRepo.py -u http://target.com --dump
 ```
 
-### Limit to 50 targets for quick testing
-
+### 4. Advanced Options
 ```bash
-python3 xposedRepo.py -i biglist.txt --max 50
+python3 xposedRepo.py -i targets.txt -t 100 --timeout 10 --state-file operation_alpha.state
 ```
 
-### Scan with more threads & higher timeout
-
-```bash
-python3 xposedRepo.py -i govsites.txt -t 200 -T 15
-```
+| Flag | Description | Default |
+| :--- | :--- | :--- |
+| `-i / --input` | List of targets (one per line) | - |
+| `-u / --url` | Single target URL | - |
+| `--dump` | Enable auto-dumping of artifacts | False |
+| `-t / --threads` | Number of worker threads | 50 |
+| `-T / --timeout` | Request timeout (seconds) | 5 |
+| `--output-dir` | Directory to save dumps | `./<domain>-xposed-<time>` |
 
 ---
 
-## 📖 Example Output
+## 📂 Output Formats
 
-Console:
+### 1. Live Dashboard (Console)
+A heavy-duty terminal UI showing:
+*   **Target Status**: `VULNERABLE` / `SUSPICIOUS`
+*   **Server Tech**: e.g., `nginx/1.18`
+*   **Action**: `Dumping...` or `Logged`
 
-```
-[VULNERABLE] https://victim.com -- 200
-[MAYBE VULNERABLE] https://weirdtarget.net -- 403
-```
-
-CSV (04-Oct-2025-xposedRepo.csv):
-
+### 2. CSV Report
+Final results are saved to a CSV file (e.g., `28-Dec-2025-xposedRepo.csv`).
 ```csv
 status,code_or_message,url
 VULNERABLE,200,https://victim.com
-MAYBE VULNERABLE,403,https://weirdtarget.net
-OK,404,https://safe.org
+SUSPICIOUS,403,https://example.org
+```
+
+### 3. State File (`.state`)
+Raw log for resuming scans.
+```text
+VULNERABLE,200,https://victim.com
+OK,404,https://safe.com
 ```
 
 ---
 
 ## ⚠️ Disclaimer
-
-This tool is intended for **security research & educational purposes only**.
-Do not use it against systems without **explicit authorization**.
-
----
-
-## 💡 Future Improvements
-
-* AsyncIO-based scanner for higher scalability.
-* JSON output mode.
-* Target deduplication & normalization improvements.
-* Plugin system for additional exposures.
-
----
-
-## 👨‍💻 Author
-
-* Developed by **Suman Roy** (Security Researcher).
-* Contributions and PRs welcome!
-
----
-
-### Made with ❤️ by Suman Roy
-
-[![LinkedIn](https://img.shields.io/badge/LinkedIn-Connect-blue?style=flat-square\&logo=linkedin)](https://www.linkedin.com/in/sumanrox/)
-
-**My bio:**
-[https://linktr.ee/sumanroy.official](https://linktr.ee/sumanroy.official)
+This tool is for **security research and authorized testing only**. Usage against systems without permission is illegal. The author assumes no liability for misuse.

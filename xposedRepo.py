@@ -19,9 +19,12 @@ import threading
 import time
 import sys
 import os
+import socket
 import urllib.parse
 from datetime import datetime
-from typing import List, Optional, Tuple, Set
+from datetime import datetime
+from typing import List, Optional, Tuple, Set, Deque
+import collections
 import requests # type: ignore
 from requests.adapters import HTTPAdapter, Retry # type: ignore
 try:
@@ -201,7 +204,7 @@ def checkGitExposure(session: requests.Session, baseUrl: str, timeout: float) ->
     return (OK, str(getattr(r, "status_code", "N/A")), baseUrl, serverHeader)
 
 
-def worker(taskUrl: str, session: requests.Session, timeout: float, stateFile: str, dumpingExecutor: Optional[concurrent.futures.ThreadPoolExecutor] = None, outputDirArg: Optional[str] = None, progress: Optional[object] = None, scanTaskID: Optional[object] = None, findingsTable: Optional[object] = None, tableLock: Optional[object] = None) -> None:
+def worker(taskUrl: str, session: requests.Session, timeout: float, stateFile: str, dumpingExecutor: Optional[concurrent.futures.ThreadPoolExecutor] = None, outputDirArg: Optional[str] = None, progress: Optional[object] = None, scanTaskID: Optional[object] = None, displayQueue: Optional[Deque] = None, queueLock: Optional[object] = None) -> None:
     """
     Worker that runs checkGitExposure and appends to state. Handles exceptions.
     Trigger dump if vulnerable and dumpingExecutor is provided.
@@ -237,17 +240,27 @@ def worker(taskUrl: str, session: requests.Session, timeout: float, stateFile: s
                 appendState(stateFile, status, codeOrMsg, url)
                 if status == VULN:
                     timeStr = datetime.now().strftime("%H:%M:%S")
+                    
+                    # Resolve IP
+                    try:
+                        parsed = urllib.parse.urlparse(url)
+                        domain = parsed.netloc.split(':')[0]
+                        ip_addr = socket.gethostbyname(domain)
+                    except:
+                        ip_addr = "N/A"
+
                     if dumpingExecutor:
-                         # Add row to table
-                         if findingsTable and tableLock:
-                             with tableLock:
-                                 findingsTable.add_row(
+                         # Add row to queue instead of table
+                         if displayQueue is not None and queueLock is not None:
+                             with queueLock:
+                                 displayQueue.append((
                                      f"[bold red]{status}[/bold red]", 
-                                     url, 
+                                     url,
+                                     f"[blue]{ip_addr}[/blue]", 
                                      f"[magenta]{serverHeader}[/magenta]",
                                      f"[dim white]{timeStr}[/dim white]",
                                      "[cyan]Dumping...[/cyan]"
-                                 )
+                                 ))
                          else:
                             print(f"[VULNERABLE] {url} [Server: {serverHeader}] [DUMPING]")
 
@@ -307,22 +320,41 @@ def worker(taskUrl: str, session: requests.Session, timeout: float, stateFile: s
                                  print(err_msg, file=sys.stderr)
                     else:
                         # No dumping, just alert
-                        if findingsTable and tableLock:
-                             with tableLock:
-                                 findingsTable.add_row(
+                        if displayQueue is not None and queueLock is not None:
+                             with queueLock:
+                                 displayQueue.append((
                                      f"[bold red]{status}[/bold red]", 
                                      url, 
+                                     f"[blue]{ip_addr}[/blue]",
                                      f"[magenta]{serverHeader}[/magenta]",
                                      f"[dim white]{timeStr}[/dim white]",
                                      "[yellow]Logged[/yellow]"
-                                 )
+                                 ))
                         else:
                              print(f"{ANSI_RED}[{status}]{ANSI_RESET} {url}")
 
                 elif status == SUSPICIOUS:
-                    if findingsTable and tableLock:
-                         with tableLock:
-                             findingsTable.add_row(f"[bold yellow]{status}[/bold yellow]", url, f"[grey50]Status: {codeOrMsg}[/grey50]")
+                    # Resolve IP for suspicious too
+                    try:
+                        parsed = urllib.parse.urlparse(url)
+                        domain = parsed.netloc.split(':')[0]
+                        ip_addr = socket.gethostbyname(domain)
+                    except:
+                        ip_addr = "N/A"
+                    
+                    timeStr = datetime.now().strftime("%H:%M:%S")
+                        
+                    if displayQueue is not None and queueLock is not None:
+                         with queueLock:
+                             # Mapping: STATUS, URL, IP, SERVER, TIME, ACTION
+                             displayQueue.append((
+                                 f"[bold yellow]{status}[/bold yellow]", 
+                                 url, 
+                                 f"[blue]{ip_addr}[/blue]", 
+                                 f"[magenta]{serverHeader}[/magenta]", 
+                                 f"[dim white]{timeStr}[/dim white]", 
+                                 f"[grey50]Status: {codeOrMsg}[/grey50]"
+                            ))
                     else:
                         print(f"{ANSI_GREEN}[{status}]{ANSI_RESET} {url}")
         
@@ -541,6 +573,42 @@ def main(argv: Optional[List[str]] = None) -> int:
 
         futures = set()
         try:
+            # Fixed-size queue for sliding window effect
+            displayQueue: Deque[Tuple] = collections.deque(maxlen=10)
+            queueLock = threading.Lock()
+
+            # Helper to rebuild table
+            def rebuildTable(queue):
+                newTable = Table(
+                    box=HEAVY_EDGE, 
+                    show_header=True, 
+                    header_style="bold white on blue", 
+                    title="[bold reverse cyan] TARGET EXPOSURE SYSTEMS [/bold reverse cyan]",
+                    expand=True,
+                    border_style="bright_blue",
+                    row_styles=["", "dim"]
+                )
+                newTable.add_column("STATUS", justify="center", width=12, style="bold", no_wrap=True)
+                newTable.add_column("TARGET URL", style="cyan", ratio=1, overflow="fold")
+                newTable.add_column("IP ADDRESS", style="blue", width=15, justify="center")
+                newTable.add_column("SERVER", style="magenta", width=20, overflow="ellipsis", no_wrap=True)
+                newTable.add_column("TIME", style="dim white", width=10, justify="center", no_wrap=True)
+                newTable.add_column("ACTION", style="grey70", width=15, justify="center", no_wrap=True)
+                
+                with queueLock:
+                    for row in queue:
+                        # Handle variable length rows (SUSPICIOUS vs VULN)
+                        if len(row) == 4: # Suspicous might be shorter? No, we padded it.
+                             # But check just in case. Old suspicious was 3 elements for table. 
+                             # We added IP, so it should be 6 elements total for full row, or handling differently
+                             
+                             # Full row is: STATUS, URL, IP, SERVER, TIME, ACTION (6 cols)
+                             # SUSPICIOUS we added: STATUS, URL, IP, MSG, "", "" (6 items)
+                             newTable.add_row(*row)
+                        else:
+                             newTable.add_row(*row)
+                return newTable
+
             for url in toProcess:
                 futures.add(executor.submit(
                     worker, 
@@ -552,14 +620,19 @@ def main(argv: Optional[List[str]] = None) -> int:
                     args.output_dir,
                     progress,      # Rich progress object
                     scanTaskID,    # Task ID to advance
-                    findingsTable, # Pass table
-                    tableLock      # Pass lock
+                    displayQueue,  # Pass queue
+                    queueLock      # Pass lock
                 ))
 
             # Monitor completion
             while futures:
                 done, futures = concurrent.futures.wait(futures, timeout=0.5, return_when=concurrent.futures.FIRST_COMPLETED)
-                # progress is updated inside worker via scanTaskID
+                
+                # Rebuild and update live view
+                live.update(Group(
+                    Panel(rebuildTable(displayQueue), border_style="cyan"),
+                    progress
+                ))
                 
             if args.dump and dumpingExecutor:
                 # We can print to console, but it might jump around with Live view. 

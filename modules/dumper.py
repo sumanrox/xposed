@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 from contextlib import closing
-import multiprocessing
+import queue
+import threading
 import os
 import os.path
 import re
@@ -29,11 +30,11 @@ def isHtml(response):
         and "text/html" in response.headers["Content-Type"]
     )
 
-def isSafePath(path):
-    """ Prevent directory traversal attacks """
+def isSafePath(path, base_dir=None):
+    """ Prevent directory traversal attacks. Path must stay within base_dir. """
     if path.startswith("/"):
         return False
-    safePath = os.path.expanduser("~")
+    safePath = os.path.abspath(base_dir) if base_dir else os.path.expanduser("~")
     return (
         os.path.commonpath(
             (os.path.realpath(os.path.join(safePath, path)), safePath)
@@ -41,7 +42,7 @@ def isSafePath(path):
         == safePath
     )
 
-def getIndexedFiles(response):
+def getIndexedFiles(response, base_dir=None):
     """ Return all the files in the directory index webpage """
     html = bs4.BeautifulSoup(response.text, "html.parser")
     files = []
@@ -49,7 +50,7 @@ def getIndexedFiles(response):
         url = urllib.parse.urlparse(link.get("href"))
         if (
             url.path
-            and isSafePath(url.path)
+            and isSafePath(url.path, base_dir)
             and not url.scheme
             and not url.netloc
         ):
@@ -102,11 +103,10 @@ def getReferencedSha1(objFile):
         pass
     return objs
 
-class Worker(multiprocessing.Process):
+class Worker(threading.Thread):
     """ Worker for processTasks """
     def __init__(self, pendingTasks, tasksDone, args):
-        super().__init__()
-        self.daemon = True
+        super().__init__(daemon=True)
         self.pendingTasks = pendingTasks
         self.tasksDone = tasksDone
         self.args = args
@@ -144,8 +144,8 @@ def processTasks(initialTasks, workerClass, jobs, args=(), tasksDone=None, progr
         return
 
     tasksSeen = set(tasksDone) if tasksDone else set()
-    pendingTasksQueue = multiprocessing.Queue()
-    tasksDoneQueue = multiprocessing.Queue()
+    pendingTasksQueue = queue.Queue()
+    tasksDoneQueue = queue.Queue()
     numPendingTasks = 0
 
     for task in initialTasks:
@@ -155,10 +155,10 @@ def processTasks(initialTasks, workerClass, jobs, args=(), tasksDone=None, progr
             numPendingTasks += 1
             tasksSeen.add(task)
 
-    processes = [workerClass(pendingTasksQueue, tasksDoneQueue, args) for _ in range(jobs)]
-    for p in processes:
-        p.start()
-    
+    threads = [workerClass(pendingTasksQueue, tasksDoneQueue, args) for _ in range(jobs)]
+    for t in threads:
+        t.start()
+
     totalTasksProcessed = 0
     totalKnownTasks = numPendingTasks
 
@@ -167,13 +167,8 @@ def processTasks(initialTasks, workerClass, jobs, args=(), tasksDone=None, progr
             taskResult = tasksDoneQueue.get(block=True)
             numPendingTasks -= 1
             totalTasksProcessed += 1
-            
-            # Determine current file from last task result? 
-            # Actually worker doesn't return which task completed easily here without modifying structure much.
-            # But we can update progress count.
+
             if progressCallback:
-                # We don't have exact filename easily available here without bigger change, 
-                # but we can send generic update
                 progressCallback(totalTasksProcessed, totalKnownTasks, "")
 
             for task in taskResult:
@@ -184,16 +179,18 @@ def processTasks(initialTasks, workerClass, jobs, args=(), tasksDone=None, progr
                     totalKnownTasks += 1
                     tasksSeen.add(task)
     except KeyboardInterrupt:
-        # Stop everything
-        for p in processes:
-            p.terminate()
-            p.join()
+        # Poison the queue so daemon threads exit cleanly
+        for _ in range(jobs):
+            try:
+                pendingTasksQueue.put_nowait(None)
+            except queue.Full:
+                break
         return
 
     for _ in range(jobs):
         pendingTasksQueue.put(None)
-    for p in processes:
-        p.join()
+    for t in threads:
+        t.join()
 
 class DownloadWorker(Worker):
     """ Download a list of files """
@@ -256,7 +253,7 @@ class RecursiveDownloadWorker(DownloadWorker):
                     if isHtml(response):
                         return [
                             filepath + filename
-                            for filename in getIndexedFiles(response)
+                            for filename in getIndexedFiles(response, directory)
                         ]
                     return []
                 else:  # file
@@ -291,7 +288,7 @@ class FindRefsWorker(DownloadWorker):
                 r"(refs(/[a-zA-Z0-9\-\.\_\*]+)+)", response.text
             ):
                 ref = ref[0]
-                if not ref.endswith("*") and isSafePath(ref):
+                if not ref.endswith("*") and isSafePath(ref, directory):
                     tasks.append(".git/%s" % ref)
                     tasks.append(".git/logs/%s" % ref)
             return tasks
@@ -652,7 +649,7 @@ def extractCommit(repo, commit, outputDir):
                 path = os.path.join(currentPath, name)
                 
                 # Check safe path for extraction
-                if not isSafePath(path):
+                if not isSafePath(path, commitDir):
                     continue
                 
                 fullPath = os.path.join(commitDir, path)

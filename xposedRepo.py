@@ -22,7 +22,6 @@ import os
 import socket
 import urllib.parse
 from datetime import datetime
-from datetime import datetime
 from typing import List, Optional, Tuple, Set, Deque
 import collections
 import requests # type: ignore
@@ -44,6 +43,7 @@ ERROR = "ERROR"
 INDEX_PAT = re.compile(r'Index of /.git', re.IGNORECASE)
 GIT_HEAD_PAT = re.compile(r'ref:\s+refs/', re.IGNORECASE)
 GIT_CONFIG_PAT = re.compile(r'\[core\]', re.IGNORECASE)
+SHA_PAT = re.compile(r'[a-f0-9]{4,40}', re.IGNORECASE)
 
 ANSI_RED = "\033[91m"  # Bright red
 ANSI_GREEN = "\033[92m"
@@ -175,7 +175,7 @@ def checkGitExposure(session: requests.Session, baseUrl: str, timeout: float) ->
             if GIT_HEAD_PAT.search(body):
                 return (VULN, str(r2.status_code), baseUrl, serverHeader)
             # Only mark as SUSPICIOUS if we got 200 with suspicious SHA-like content (but not confirmed)
-            if len(body) > 0 and re.search(r'[a-f0-9]{4,40}', body, re.IGNORECASE):
+            if len(body) > 0 and SHA_PAT.search(body):
                 return (SUSPICIOUS, str(r2.status_code), baseUrl, serverHeader)
 
         # /.git/config
@@ -204,7 +204,7 @@ def checkGitExposure(session: requests.Session, baseUrl: str, timeout: float) ->
     return (OK, str(getattr(r, "status_code", "N/A")), baseUrl, serverHeader)
 
 
-def worker(taskUrl: str, session: requests.Session, timeout: float, stateFile: str, dumpingExecutor: Optional[concurrent.futures.ThreadPoolExecutor] = None, outputDirArg: Optional[str] = None, progress: Optional[object] = None, scanTaskID: Optional[object] = None, displayQueue: Optional[Deque] = None, queueLock: Optional[object] = None) -> None:
+def worker(taskUrl: str, session: requests.Session, timeout: float, stateFile: str, dumpingExecutor: Optional[concurrent.futures.ThreadPoolExecutor] = None, outputDirArg: Optional[str] = None, progress: Optional[object] = None, scanTaskID: Optional[object] = None, displayQueue: Optional[Deque] = None, queueLock: Optional[object] = None, resolve: bool = False) -> None:
     """
     Worker that runs checkGitExposure and appends to state. Handles exceptions.
     Trigger dump if vulnerable and dumpingExecutor is provided.
@@ -232,131 +232,131 @@ def worker(taskUrl: str, session: requests.Session, timeout: float, stateFile: s
         pass
 
     try:
-        if result is None:
-            pass
-        else:
+        if result:
             status, codeOrMsg, url, serverHeader = result
-            if status in (VULN, SUSPICIOUS):
-                appendState(stateFile, status, codeOrMsg, url)
-                if status == VULN:
-                    timeStr = datetime.now().strftime("%H:%M:%S")
+            appendState(stateFile, status, codeOrMsg, url)
+            if status == VULN:
+                timeStr = datetime.now().strftime("%H:%M:%S")
                     
-                    # Resolve IP
+                # Resolve IP (optional — costs CPU and blocks threads)
+                ip_addr = "N/A"
+                if resolve:
                     try:
                         parsed = urllib.parse.urlparse(url)
                         domain = parsed.netloc.split(':')[0]
                         ip_addr = socket.gethostbyname(domain)
-                    except:
-                        ip_addr = "N/A"
+                    except Exception:
+                        pass
 
-                    if dumpingExecutor:
-                         # Add row to queue instead of table
-                         if displayQueue is not None and queueLock is not None:
-                             with queueLock:
-                                 displayQueue.append((
-                                     f"[bold red]{status}[/bold red]", 
-                                     url,
-                                     f"[blue]{ip_addr}[/blue]", 
-                                     f"[magenta]{serverHeader}[/magenta]",
-                                     f"[dim white]{timeStr}[/dim white]",
-                                     "[cyan]Dumping...[/cyan]"
-                                 ))
-                         else:
-                            print(f"[VULNERABLE] {url} [Server: {serverHeader}] [DUMPING]")
+                if dumpingExecutor:
+                     # Add row to queue instead of table
+                     if displayQueue is not None and queueLock is not None:
+                         with queueLock:
+                             displayQueue.append((
+                                 f"[bold red]{status}[/bold red]", 
+                                 url,
+                                 f"[blue]{ip_addr}[/blue]", 
+                                 f"[magenta]{serverHeader}[/magenta]",
+                                 f"[dim white]{timeStr}[/dim white]",
+                                 "[cyan]Dumping...[/cyan]"
+                             ))
+                     else:
+                        print(f"[VULNERABLE] {url} [Server: {serverHeader}] [DUMPING]")
 
-                         try:
-                            # Determine output directory
-                            parsed = urllib.parse.urlparse(url)
-                            domain = parsed.netloc.replace(':', '_')
-                            if not domain:
-                                domain = "unknown_target"
+                     try:
+                        # Determine output directory
+                        parsed = urllib.parse.urlparse(url)
+                        domain = parsed.netloc.replace(':', '_')
+                        if not domain:
+                            domain = "unknown_target"
                             
-                            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-                            defaultName = f"{domain}-xposed-{timestamp}"
-                            finalOutputDir = outputDirArg if outputDirArg else defaultName
+                        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+                        defaultName = f"{domain}-xposed-{timestamp}"
+                        finalOutputDir = outputDirArg if outputDirArg else defaultName
                             
-                            dumpUrl = url
-                            if not dumpUrl.endswith("/.git/"):
-                                dumpUrl = dumpUrl.rstrip("/")
-                                if not dumpUrl.endswith("/.git"):
-                                    dumpUrl += "/.git/"
+                        dumpUrl = url
+                        if not dumpUrl.endswith("/.git/"):
+                            dumpUrl = dumpUrl.rstrip("/")
+                            if not dumpUrl.endswith("/.git"):
+                                dumpUrl += "/.git/"
                             
-                            # Define a wrapper to handle the dump
-                            def runDump():
-                                taskID = None
-                                try:
-                                    if progress:
-                                        taskID = progress.add_task(f"[cyan]Dumping {domain}...", total=None)
+                        # Define a wrapper to handle the dump
+                        def runDump():
+                            taskID = None
+                            try:
+                                if progress:
+                                    taskID = progress.add_task(f"[cyan]Dumping {domain}...", total=None)
 
-                                    def progressCallback(completed, total, currentFile):
-                                        if progress and taskID is not None:
-                                            progress.update(taskID, completed=completed, total=total if total > 0 else None)
+                                def progressCallback(completed, total, currentFile):
+                                    if progress and taskID is not None:
+                                        progress.update(taskID, completed=completed, total=total if total > 0 else None)
 
-                                    commitCount = modules.dumper.dumpAndExtract(dumpUrl, finalOutputDir, progressCallback=progressCallback)
+                                commitCount = modules.dumper.dumpAndExtract(dumpUrl, finalOutputDir, progressCallback=progressCallback)
                                     
-                                    if progress and taskID is not None:
-                                        # Keep it green on success
-                                        if isinstance(commitCount, int) and commitCount > 0:
-                                            statsMsg = f"({commitCount} commits)"
-                                        else:
-                                            statsMsg = ""
-                                        progress.update(taskID, completed=100, total=100, description=f"[green]Dumped {domain} ✓ {statsMsg}")
+                                if progress and taskID is not None:
+                                    # Keep it green on success
+                                    if isinstance(commitCount, int) and commitCount > 0:
+                                        statsMsg = f"({commitCount} commits)"
+                                    else:
+                                        statsMsg = ""
+                                    progress.update(taskID, completed=100, total=100, description=f"[green]Dumped {domain} ✓ {statsMsg}")
                                         
-                                except KeyboardInterrupt:
-                                    if progress and taskID is not None:
-                                        progress.update(taskID, description=f"[yellow]Stopped {domain}")
-                                except Exception as e:
-                                    if progress and taskID is not None:
-                                        progress.update(taskID, description=f"[red]Failed {domain}: {str(e)}")
-                                        # progress.console.print(f"[red][FAIL] {url} ({str(e)})") # Optional to reduce noise
+                            except KeyboardInterrupt:
+                                if progress and taskID is not None:
+                                    progress.update(taskID, description=f"[yellow]Stopped {domain}")
+                            except Exception as e:
+                                if progress and taskID is not None:
+                                    progress.update(taskID, description=f"[red]Failed {domain}: {str(e)}")
+                                    # progress.console.print(f"[red][FAIL] {url} ({str(e)})") # Optional to reduce noise
 
-                            dumpingExecutor.submit(runDump)
+                        dumpingExecutor.submit(runDump)
                             
-                         except Exception as dumpErr:
-                             err_msg = f"[red][ERROR] Failed to queue dump for {url}: {dumpErr}[/red]"
-                             if progress:
-                                 progress.console.print(err_msg)
-                             else:
-                                 print(err_msg, file=sys.stderr)
-                    else:
-                        # No dumping, just alert
-                        if displayQueue is not None and queueLock is not None:
-                             with queueLock:
-                                 displayQueue.append((
-                                     f"[bold red]{status}[/bold red]", 
-                                     url, 
-                                     f"[blue]{ip_addr}[/blue]",
-                                     f"[magenta]{serverHeader}[/magenta]",
-                                     f"[dim white]{timeStr}[/dim white]",
-                                     "[yellow]Logged[/yellow]"
-                                 ))
-                        else:
-                             print(f"{ANSI_RED}[{status}]{ANSI_RESET} {url}")
-
-                elif status == SUSPICIOUS:
-                    # Resolve IP for suspicious too
-                    try:
-                        parsed = urllib.parse.urlparse(url)
-                        domain = parsed.netloc.split(':')[0]
-                        ip_addr = socket.gethostbyname(domain)
-                    except:
-                        ip_addr = "N/A"
-                    
-                    timeStr = datetime.now().strftime("%H:%M:%S")
-                        
+                     except Exception as dumpErr:
+                         err_msg = f"[red][ERROR] Failed to queue dump for {url}: {dumpErr}[/red]"
+                         if progress:
+                             progress.console.print(err_msg)
+                         else:
+                             print(err_msg, file=sys.stderr)
+                else:
+                    # No dumping, just alert
                     if displayQueue is not None and queueLock is not None:
                          with queueLock:
-                             # Mapping: STATUS, URL, IP, SERVER, TIME, ACTION
                              displayQueue.append((
-                                 f"[bold yellow]{status}[/bold yellow]", 
+                                 f"[bold red]{status}[/bold red]", 
                                  url, 
-                                 f"[blue]{ip_addr}[/blue]", 
-                                 f"[magenta]{serverHeader}[/magenta]", 
-                                 f"[dim white]{timeStr}[/dim white]", 
-                                 f"[grey50]Status: {codeOrMsg}[/grey50]"
-                            ))
+                                 f"[blue]{ip_addr}[/blue]",
+                                 f"[magenta]{serverHeader}[/magenta]",
+                                 f"[dim white]{timeStr}[/dim white]",
+                                 "[yellow]Logged[/yellow]"
+                             ))
                     else:
-                        print(f"{ANSI_GREEN}[{status}]{ANSI_RESET} {url}")
+                         print(f"{ANSI_RED}[{status}]{ANSI_RESET} {url}")
+
+            elif status == SUSPICIOUS:
+                ip_addr = "N/A"
+                if resolve:
+                    try:
+                        parsed = urllib.parse.urlparse(url)
+                        domain = parsed.netloc.split(':')[0]
+                        ip_addr = socket.gethostbyname(domain)
+                    except Exception:
+                        pass
+                    
+                timeStr = datetime.now().strftime("%H:%M:%S")
+                        
+                if displayQueue is not None and queueLock is not None:
+                     with queueLock:
+                         # Mapping: STATUS, URL, IP, SERVER, TIME, ACTION
+                         displayQueue.append((
+                             f"[bold yellow]{status}[/bold yellow]", 
+                             url, 
+                             f"[blue]{ip_addr}[/blue]", 
+                             f"[magenta]{serverHeader}[/magenta]", 
+                             f"[dim white]{timeStr}[/dim white]", 
+                             f"[grey50]Status: {codeOrMsg}[/grey50]"
+                        ))
+                else:
+                    print(f"{ANSI_GREEN}[{status}]{ANSI_RESET} {url}")
         
         with remainingLock:
             remaining -= 1
@@ -380,19 +380,21 @@ def worker(taskUrl: str, session: requests.Session, timeout: float, stateFile: s
             progress.advance(scanTaskID, 1)
 
 
-def printRemaining() -> None:
-    global remaining, totalTargets, lastChecked
-    try:
-        with remainingLock:
-            print(f"Remaining: {remaining}/{totalTargets}  Last checked: {lastChecked:80}", end='\r', flush=True)
-    except Exception:
-        # non-fatal, ignore
-        pass
-
-
 # -------------------------
 # Utilities
 # -------------------------
+def streamTargetsFromFile(path: str):
+    """Yield normalized targets from a file without loading all into memory."""
+    try:
+        with open(path, "r", encoding="utf-8", errors="ignore") as fh:
+            for line in fh:
+                u = normalizeUrl(line)
+                if u:
+                    yield u
+    except Exception as e:
+        print(f"[ERROR] Could not load input file {path}: {e}", file=sys.stderr)
+
+
 def loadTargetsFromFile(path: str) -> List[str]:
     lst: List[str] = []
     try:
@@ -404,6 +406,42 @@ def loadTargetsFromFile(path: str) -> List[str]:
     except Exception as e:
         print(f"[ERROR] Could not load input file {path}: {e}", file=sys.stderr)
     return lst
+
+
+def boundedMap(func, iterable, maxWorkers=50, maxInflight=None):
+    """
+    Apply *func* to each item in *iterable* using a thread pool,
+    but keep the number of in-flight futures bounded to prevent
+    unbounded memory growth on huge inputs.
+    Yields results in completion order.
+    """
+    if maxInflight is None:
+        maxInflight = maxWorkers * 2
+
+    import concurrent.futures
+    from concurrent.futures import FIRST_COMPLETED
+
+    it = iter(iterable)
+    with concurrent.futures.ThreadPoolExecutor(max_workers=maxWorkers) as executor:
+        futures = set()
+        # Seed initial batch
+        for item in it:
+            futures.add(executor.submit(func, item))
+            if len(futures) >= maxInflight:
+                break
+
+        while futures:
+            done, futures = concurrent.futures.wait(
+                futures, return_when=FIRST_COMPLETED
+            )
+            for future in done:
+                yield future.result()
+            # Replenish
+            for _ in done:
+                try:
+                    futures.add(executor.submit(func, next(it)))
+                except StopIteration:
+                    break
 
 
 def writeFinalCsv(stateFile: str, outPrefix: str = "RepoXpose") -> None:
@@ -456,6 +494,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     parser.add_argument("--csv", help="Generate CSV report after scan completes", action="store_true")
     parser.add_argument("--dump", help="Automatically dump and recover artifacts from vulnerable targets", action="store_true")
     parser.add_argument("--output-dir", help="Output directory for dump (default: domain-xposed-datetime)", type=str)
+    parser.add_argument("--resolve", help="Resolve IP addresses for findings (slower)", action="store_true")
     args = parser.parse_args(argv)
 
     if not args.input and not args.url:
@@ -549,7 +588,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         TextColumn("[progress.percentage]{task.percentage:>3.0f}%"),
         MofNCompleteColumn(),
         TimeRemainingColumn(),
-        refresh_per_second=10
+        refresh_per_second=4
     )
 
     # 3. Create Group and Live View
@@ -560,7 +599,7 @@ def main(argv: Optional[List[str]] = None) -> int:
 
     # Wrap execution in Live context
     # Note: We pass the table and lock to the worker
-    with Live(ui_group, refresh_per_second=10, screen=False) as live:
+    with Live(ui_group, refresh_per_second=4, screen=False) as live:
         
         # Create the Overall Scan Progress bar
         scanTaskID = progress.add_task("[bold white]Scanning Targets[/bold white]", total=totalTargets)
@@ -609,30 +648,71 @@ def main(argv: Optional[List[str]] = None) -> int:
                              newTable.add_row(*row)
                 return newTable
 
-            for url in toProcess:
-                futures.add(executor.submit(
-                    worker, 
-                    url, 
-                    session, 
-                    args.timeout, 
-                    args.state_file, 
-                    dumpingExecutor, 
-                    args.output_dir,
-                    progress,      # Rich progress object
-                    scanTaskID,    # Task ID to advance
-                    displayQueue,  # Pass queue
-                    queueLock      # Pass lock
-                ))
+            targetIter = iter(toProcess)
+            maxInflight = args.threads * 2
 
-            # Monitor completion
+            # Seed initial batch (bounded to prevent unbounded memory growth)
+            for _ in range(min(maxInflight, totalTargets)):
+                try:
+                    url = next(targetIter)
+                    futures.add(executor.submit(
+                        worker,
+                        url,
+                        session,
+                        args.timeout,
+                        args.state_file,
+                        dumpingExecutor,
+                        args.output_dir,
+                        progress,
+                        scanTaskID,
+                        displayQueue,
+                        queueLock,
+                        args.resolve
+                    ))
+                except StopIteration:
+                    break
+
+            # Track queue length to avoid unnecessary table rebuilds
+            lastQueueLen = 0
+
+            # Monitor completion and replenish
             while futures:
                 done, futures = concurrent.futures.wait(futures, timeout=0.5, return_when=concurrent.futures.FIRST_COMPLETED)
-                
-                # Rebuild and update live view
-                live.update(Group(
-                    Panel(rebuildTable(displayQueue), border_style="cyan"),
-                    progress
-                ))
+
+                for future in done:
+                    try:
+                        future.result()
+                    except Exception:
+                        pass
+
+                for _ in done:
+                    try:
+                        url = next(targetIter)
+                        futures.add(executor.submit(
+                            worker,
+                            url,
+                            session,
+                            args.timeout,
+                            args.state_file,
+                            dumpingExecutor,
+                            args.output_dir,
+                            progress,
+                            scanTaskID,
+                            displayQueue,
+                            queueLock,
+                            args.resolve
+                        ))
+                    except StopIteration:
+                        break
+
+                # Rebuild table only when new rows arrived (saves CPU)
+                currentQueueLen = len(displayQueue)
+                if currentQueueLen != lastQueueLen:
+                    lastQueueLen = currentQueueLen
+                    live.update(Group(
+                        Panel(rebuildTable(displayQueue), border_style="cyan"),
+                        progress
+                    ))
                 
             if args.dump and dumpingExecutor:
                 # We can print to console, but it might jump around with Live view. 
@@ -666,11 +746,6 @@ def main(argv: Optional[List[str]] = None) -> int:
             from rich import print as rprint
             rprint(f"[bold red]Fatal Error: {e}[/bold red]")
             os._exit(2)
-
-    print("\nScan complete.")
-    if args.csv:
-        writeFinalCsv(args.state_file)
-    return 0
 
     print("\nScan complete.")
     if args.csv:

@@ -15,6 +15,9 @@ class FakeResponse:
         self.text = text
         self.headers = headers or {}
 
+    def close(self):
+        pass
+
 
 class TestCheckGitExposure:
     """Scanner probes should correctly identify exposed .git directories."""

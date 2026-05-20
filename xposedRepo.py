@@ -25,6 +25,8 @@ import urllib.parse
 from datetime import datetime
 from typing import List, Optional, Tuple, Set, Deque
 import collections
+import itertools
+import sqlite3
 import requests # type: ignore
 from requests.adapters import HTTPAdapter, Retry # type: ignore
 try:
@@ -69,8 +71,106 @@ remaining = 0
 lastChecked = ""
 stateLock = threading.Lock()
 progressLock = threading.Lock()  # rich.Progress is NOT thread-safe
-processedUrls: Set[str] = set()  # urls we've recorded in state (resumed or live)
-vulnResults: List[Tuple[str, str, str]] = []  # (STATUS, STATUS_CODE_OR_MSG, URL)
+
+
+# -------------------------
+# Disk-backed dedup + rate limit (dnsx-inspired)
+# -------------------------
+class TokenBucket:
+    """Thread-safe token bucket for rate limiting."""
+    def __init__(self, rate: int, per: float = 1.0):
+        self.rate = max(rate, 1)
+        self.per = per
+        self.tokens = float(rate)
+        self.last = time.monotonic()
+        self.lock = threading.Lock()
+
+    def take(self):
+        with self.lock:
+            now = time.monotonic()
+            elapsed = now - self.last
+            self.last = now
+            self.tokens += elapsed * (self.rate / self.per)
+            if self.tokens > self.rate:
+                self.tokens = self.rate
+            if self.tokens < 1:
+                sleep_time = (1 - self.tokens) * (self.per / self.rate)
+                time.sleep(sleep_time)
+                self.tokens = 0
+            else:
+                self.tokens -= 1
+
+
+class DedupStore:
+    """SQLite-backed deduplication store with WAL mode and batched writes."""
+    def __init__(self, db_path: str, flush_interval: float = 2.0, batch_size: int = 500):
+        self.db_path = db_path
+        self.conn = sqlite3.connect(db_path, check_same_thread=False)
+        self.conn.execute("PRAGMA journal_mode=WAL")
+        self.conn.execute("PRAGMA synchronous=NORMAL")
+        self.conn.execute("CREATE TABLE IF NOT EXISTS seen(url TEXT PRIMARY KEY)")
+        self.conn.commit()
+        self._pending: List[str] = []
+        self._lock = threading.Lock()
+        self._last_flush = time.monotonic()
+        self._flush_interval = flush_interval
+        self._batch_size = batch_size
+
+    def has(self, url: str) -> bool:
+        with self._lock:
+            if url in self._pending:
+                return True
+        self._maybe_flush()
+        cur = self.conn.execute("SELECT 1 FROM seen WHERE url=?", (url,))
+        return cur.fetchone() is not None
+
+    def add(self, url: str):
+        with self._lock:
+            self._pending.append(url)
+            should_flush = (
+                len(self._pending) >= self._batch_size
+                or (time.monotonic() - self._last_flush) > self._flush_interval
+            )
+        if should_flush:
+            self._flush()
+
+    def add_many(self, urls: List[str]):
+        if not urls:
+            return
+        with self._lock:
+            self._pending.extend(urls)
+        self._flush()
+
+    def _maybe_flush(self):
+        with self._lock:
+            should_flush = (
+                len(self._pending) >= self._batch_size
+                or (time.monotonic() - self._last_flush) > self._flush_interval
+            )
+        if should_flush:
+            self._flush()
+
+    def _flush(self):
+        with self._lock:
+            if not self._pending:
+                return
+            try:
+                self.conn.executemany(
+                    "INSERT OR IGNORE INTO seen(url) VALUES (?)",
+                    [(u,) for u in self._pending]
+                )
+                self.conn.commit()
+            except Exception:
+                pass
+            self._pending.clear()
+            self._last_flush = time.monotonic()
+
+    def close(self):
+        self._flush()
+        try:
+            self.conn.close()
+        except Exception:
+            pass
 
 
 # -------------------------
@@ -96,6 +196,9 @@ def normalizeUrl(u: str) -> Optional[str]:
         u = u.strip()
         if not u:
             return None
+        # reject wildcard DNS patterns (e.g., *.example.com)
+        if u.startswith("*.") or "/*." in u:
+            return None
         if not re.match(r'^https?://', u):
             u = "https://" + u
         # remove trailing slash for consistency
@@ -107,44 +210,42 @@ def normalizeUrl(u: str) -> Optional[str]:
 # -------------------------
 # State file handling
 # -------------------------
-def loadState(stateFile: str) -> None:
+def loadState(stateFile: str, dedup: DedupStore) -> None:
     """
-    Reads existing .state file and populates processedUrls and vulnResults accordingly.
+    Reads existing .state file and populates dedup store.
     State line format: STATUS,STATUS-CODE-OR-MSG,URL
     """
-    global processedUrls, vulnResults
     if not os.path.exists(stateFile):
         return
+    urls: List[str] = []
     try:
         with open(stateFile, "r", encoding="utf-8", errors="ignore") as fh:
             for line in fh:
                 line = line.strip()
                 if not line:
                     continue
-                # split only first two commas to allow commas in message (if any)
                 parts = line.split(",", 2)
                 if len(parts) < 3:
                     continue
-                status, codeOrMsg, url = parts[0].strip(), parts[1].strip(), parts[2].strip()
-                processedUrls.add(url)
-                if status.upper() in (VULN, SUSPICIOUS):
-                    vulnResults.append((status.upper(), codeOrMsg, url))
+                url = parts[2].strip()
+                if url:
+                    urls.append(url)
     except Exception as e:
         print(f"[WARN] Failed to read state file {stateFile}: {e}", file=sys.stderr)
+        return
+    if urls:
+        dedup.add_many(urls)
 
 
-def appendState(stateFile: str, status: str, codeOrMsg: str, url: str) -> None:
+def appendState(stateFile: str, dedup: DedupStore, status: str, codeOrMsg: str, url: str) -> None:
     """
-    Thread-safe append to state file.
+    Thread-safe append to state file + dedup store.
     """
-    global processedUrls
     try:
         with stateLock:
             with open(stateFile, "a", encoding="utf-8") as fh:
                 fh.write(f"{status},{codeOrMsg},{url}\n")
-            processedUrls.add(url)
-            if status.upper() in (VULN, SUSPICIOUS):
-                vulnResults.append((status.upper(), codeOrMsg, url))
+        dedup.add(url)
     except Exception as e:
         # we must not crash on state write failure
         print(f"[ERROR] Failed to write to state file {stateFile}: {e}", file=sys.stderr)
@@ -245,7 +346,7 @@ def checkGitExposure(session: requests.Session, baseUrl: str, timeout: float) ->
     return (OK, str(getattr(r, "status_code", "N/A")), baseUrl, serverHeader)
 
 
-def worker(taskUrl: str, session: requests.Session, timeout: float, stateFile: str, dumpingExecutor: Optional[concurrent.futures.ThreadPoolExecutor] = None, outputDirArg: Optional[str] = None, progress: Optional[object] = None, scanTaskID: Optional[object] = None, displayQueue: Optional[Deque] = None, queueLock: Optional[object] = None, resolve: bool = False) -> None:
+def worker(taskUrl: str, session: requests.Session, timeout: float, stateFile: str, dedup: DedupStore, limiter: Optional[TokenBucket] = None, dumpingExecutor: Optional[concurrent.futures.ThreadPoolExecutor] = None, outputDirArg: Optional[str] = None, progress: Optional[object] = None, scanTaskID: Optional[object] = None, displayQueue: Optional[Deque] = None, queueLock: Optional[object] = None, resolve: bool = False) -> None:
     """
     Worker that runs checkGitExposure and appends to state. Handles exceptions.
     Trigger dump if vulnerable and dumpingExecutor is provided.
@@ -257,7 +358,7 @@ def worker(taskUrl: str, session: requests.Session, timeout: float, stateFile: s
     result = None
     try:
         # If already processed (from state resume), skip
-        if taskUrl in processedUrls:
+        if dedup.has(taskUrl):
             with remainingLock:
                 remaining -= 1
                 lastChecked = taskUrl
@@ -265,6 +366,9 @@ def worker(taskUrl: str, session: requests.Session, timeout: float, stateFile: s
                 with progressLock:
                     progress.advance(scanTaskID, 1)
             return
+
+        if limiter:
+            limiter.take()
 
         result = checkGitExposure(session, taskUrl, timeout)
     except KeyboardInterrupt:
@@ -276,7 +380,7 @@ def worker(taskUrl: str, session: requests.Session, timeout: float, stateFile: s
     try:
         if result:
             status, codeOrMsg, url, serverHeader = result
-            appendState(stateFile, status, codeOrMsg, url)
+            appendState(stateFile, dedup, status, codeOrMsg, url)
             if status == VULN:
                 timeStr = datetime.now().strftime("%H:%M:%S")
 
@@ -419,7 +523,7 @@ def worker(taskUrl: str, session: requests.Session, timeout: float, stateFile: s
         os._exit(1)
     except Exception as e:
         # Error handling
-        appendState(stateFile, ERROR, str(e), taskUrl)
+        appendState(stateFile, dedup, ERROR, str(e), taskUrl)
         with remainingLock:
             remaining -= 1
             lastChecked = taskUrl
@@ -495,8 +599,8 @@ def boundedMap(func, iterable, maxWorkers=50, maxInflight=None):
 
 def writeFinalCsv(stateFile: str, outPrefix: str = "RepoXpose") -> None:
     """
-    Writes the vulnResults + ALL entries from state (processedUrls tracked separately)
-    into a CSV named like: DD-Mmm-YYYY-RepoXpose.csv
+    Reads the .state file and writes all entries into a CSV
+    named like: DD-Mmm-YYYY-RepoXpose.csv
     """
     try:
         today = datetime.now()
@@ -528,6 +632,24 @@ def writeFinalCsv(stateFile: str, outPrefix: str = "RepoXpose") -> None:
         print(f"\n[ERROR] Failed to write final CSV: {e}", file=sys.stderr)
 
 
+def count_lines(path: str) -> int:
+    """Fast line count for progress bar totals (reads in binary chunks)."""
+    count = 0
+    with open(path, "rb") as f:
+        for _ in f:
+            count += 1
+    return count
+
+
+def stream_targets(path: str, dedup: DedupStore):
+    """Yield normalized targets from a file, skipping already-seen URLs."""
+    with open(path, "r", encoding="utf-8", errors="ignore") as fh:
+        for line in fh:
+            u = normalizeUrl(line)
+            if u and not dedup.has(u):
+                yield u
+
+
 # -------------------------
 # Main orchestration
 # -------------------------
@@ -538,6 +660,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     parser.add_argument("-u", "--url", help="Single target URL", type=str)
     parser.add_argument("-t", "--threads", help=f"Number of parallel workers (default: {DEFAULT_THREADS})", type=int, default=DEFAULT_THREADS)
     parser.add_argument("-T", "--timeout", help=f"Request timeout seconds (default: {DEFAULT_TIMEOUT})", type=float, default=DEFAULT_TIMEOUT)
+    parser.add_argument("--rate-limit", help="Max requests per second (0 = unlimited)", type=int, default=0)
     parser.add_argument("--state-file", help="State file to resume from (default: auto-generated with timestamp)", type=str, default=None)
     parser.add_argument("--max", help="Max targets to process from input file (for testing)", type=int, default=0)
     parser.add_argument("--csv", help="Generate CSV report after scan completes", action="store_true")
@@ -555,39 +678,43 @@ def main(argv: Optional[List[str]] = None) -> int:
         timestamp = now.strftime("%Y%m%d_%H%M%S")
         args.state_file = f".state_{timestamp}"
 
-    # load state if present
+    # Disk-backed dedup store (sqlite) + optional rate limiter
+    dedup = DedupStore(db_path=f"{args.state_file}.db")
+    limiter: Optional[TokenBucket] = None
+    if args.rate_limit > 0:
+        limiter = TokenBucket(rate=args.rate_limit)
+
+    # load previous state into dedup store
     try:
-        loadState(args.state_file)
+        loadState(args.state_file, dedup)
     except Exception as e:
         print(f"[WARN] Could not load state file: {e}", file=sys.stderr)
 
-    targets: List[str] = []
+    # Build streaming target iterator and count for progress bar
+    targetIter: iter = iter([])
+    totalLines = 0
     if args.url:
         u = normalizeUrl(args.url)
         if not u:
             print("[ERROR] Invalid URL provided via --url", file=sys.stderr)
+            dedup.close()
             return 2
-        targets = [u]
+        targetIter = iter([u])
+        totalLines = 1
     else:
-        targets = loadTargetsFromFile(args.input)
+        totalLines = count_lines(args.input)
+        targetIter = stream_targets(args.input, dedup)
         if args.max and args.max > 0:
-            targets = targets[:args.max]
+            targetIter = itertools.islice(targetIter, args.max)
 
-    if not targets:
-        print("[ERROR] No valid targets loaded.", file=sys.stderr)
-        return 2
-
-    # filter out already processed urls (resumed state)
-    toProcess = [t for t in targets if t not in processedUrls]
-
-    totalTargets = len(toProcess)
-    remaining = totalTargets
+    totalTargets = totalLines
+    remaining = totalLines
 
     if totalTargets == 0:
         print("No remaining targets to process (state file indicates all done).")
-        # write final CSV from state if flag is set
         if args.csv:
             writeFinalCsv(args.state_file)
+        dedup.close()
         return 0
 
     session = makeSession(timeout=int(args.timeout), maxRetries=1, poolConnections=args.threads+10, poolMaxSize=args.threads+10)
@@ -600,7 +727,6 @@ def main(argv: Optional[List[str]] = None) -> int:
         pass
 
     # run thread pool
-    # Create a Rich Progress manager
     from rich.progress import Progress, SpinnerColumn, BarColumn, TextColumn, TimeRemainingColumn, TransferSpeedColumn, MofNCompleteColumn
     from rich.console import Console
     from rich.panel import Panel
@@ -608,14 +734,13 @@ def main(argv: Optional[List[str]] = None) -> int:
     from rich.live import Live
     from rich.console import Group
     from rich.box import HEAVY_EDGE
-    
+
     # 1. Create the Findings Table
     findingsTable = Table(
-        box=HEAVY_EDGE, 
-        show_header=True, 
-        header_style="bold white on blue", 
+        box=HEAVY_EDGE,
+        show_header=True,
+        header_style="bold white on blue",
         title="[bold reverse cyan] TARGET EXPOSURE SYSTEMS [/bold reverse cyan]",
-        # title_style="bold cyan", # Title style is handled in the text itself for reverse effect
         expand=True,
         border_style="bright_blue",
         row_styles=["", "dim"]
@@ -625,7 +750,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     findingsTable.add_column("SERVER", style="magenta")
     findingsTable.add_column("TIME", style="dim white")
     findingsTable.add_column("ACTION", style="grey70")
-    
+
     # Lock for table updates
     tableLock = threading.Lock()
 
@@ -647,12 +772,11 @@ def main(argv: Optional[List[str]] = None) -> int:
     )
 
     # Wrap execution in Live context
-    # Note: We pass the table and lock to the worker
     with Live(ui_group, refresh_per_second=4, screen=False) as live:
-        
+
         # Create the Overall Scan Progress bar
         scanTaskID = progress.add_task("[bold white]Scanning Targets[/bold white]", total=totalTargets)
-        
+
         executor = concurrent.futures.ThreadPoolExecutor(max_workers=args.threads)
 
         dumpingExecutor = None
@@ -670,9 +794,9 @@ def main(argv: Optional[List[str]] = None) -> int:
             # Helper to rebuild table
             def rebuildTable(queue):
                 newTable = Table(
-                    box=HEAVY_EDGE, 
-                    show_header=True, 
-                    header_style="bold white on blue", 
+                    box=HEAVY_EDGE,
+                    show_header=True,
+                    header_style="bold white on blue",
                     title="[bold reverse cyan] TARGET EXPOSURE SYSTEMS [/bold reverse cyan]",
                     expand=True,
                     border_style="bright_blue",
@@ -684,26 +808,19 @@ def main(argv: Optional[List[str]] = None) -> int:
                 newTable.add_column("SERVER", style="magenta", width=20, overflow="ellipsis", no_wrap=True)
                 newTable.add_column("TIME", style="dim white", width=10, justify="center", no_wrap=True)
                 newTable.add_column("ACTION", style="grey70", width=15, justify="center", no_wrap=True)
-                
+
                 with queueLock:
                     for row in queue:
-                        # Handle variable length rows (SUSPICIOUS vs VULN)
-                        if len(row) == 4: # Suspicous might be shorter? No, we padded it.
-                             # But check just in case. Old suspicious was 3 elements for table. 
-                             # We added IP, so it should be 6 elements total for full row, or handling differently
-                             
-                             # Full row is: STATUS, URL, IP, SERVER, TIME, ACTION (6 cols)
-                             # SUSPICIOUS we added: STATUS, URL, IP, MSG, "", "" (6 items)
+                        if len(row) == 4:
                              newTable.add_row(*row)
                         else:
                              newTable.add_row(*row)
                 return newTable
 
-            targetIter = iter(toProcess)
             maxInflight = args.threads * 2
 
             # Seed initial batch (bounded to prevent unbounded memory growth)
-            for _ in range(min(maxInflight, totalTargets)):
+            for _ in range(maxInflight):
                 try:
                     url = next(targetIter)
                     futures.add(executor.submit(
@@ -712,6 +829,8 @@ def main(argv: Optional[List[str]] = None) -> int:
                         session,
                         args.timeout,
                         args.state_file,
+                        dedup,
+                        limiter,
                         dumpingExecutor,
                         args.output_dir,
                         progress,
@@ -747,6 +866,8 @@ def main(argv: Optional[List[str]] = None) -> int:
                             session,
                             args.timeout,
                             args.state_file,
+                            dedup,
+                            limiter,
                             dumpingExecutor,
                             args.output_dir,
                             progress,
@@ -770,19 +891,16 @@ def main(argv: Optional[List[str]] = None) -> int:
                     ))
                     # Force GC to reclaim old Rich Table/Panel objects and prevent memory creep
                     gc.collect()
-                
+
             if args.dump and dumpingExecutor:
-                # We can print to console, but it might jump around with Live view. 
-                # Better to use a transient task or just let it finish.
                 pass
 
             # Clean shutdown (non-interrupt case)
             if args.dump and dumpingExecutor:
                 dumpingExecutor.shutdown(wait=True)
             executor.shutdown(wait=True)
-                
+
         except KeyboardInterrupt:
-            # FORCE EXIT to prevent traceback spam from threading shutdown
             try:
                  live.stop()
             except:
@@ -791,10 +909,8 @@ def main(argv: Optional[List[str]] = None) -> int:
             from rich import print as rprint
             rprint("\n[bold yellow]Keyboard Interrupt! Exiting immediately...[/bold yellow]")
             os._exit(1)
-            
+
         except Exception as e:
-            # Use progress console to print error cleanly
-            # But normally we just exit
             try:
                  live.stop()
             except:
@@ -807,6 +923,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     print("\nScan complete.")
     if args.csv:
         writeFinalCsv(args.state_file)
+    dedup.close()
     return 0
 
 

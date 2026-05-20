@@ -38,6 +38,12 @@ class TestNormalizeUrl:
     def test_handles_url_with_path(self):
         assert normalizeUrl("example.com/path") == "https://example.com/path"
 
+    def test_rejects_wildcard_domain(self):
+        assert normalizeUrl("*.example.com") is None
+
+    def test_rejects_wildcard_with_scheme(self):
+        assert normalizeUrl("https://*.example.com") is None
+
 
 class TestStreamTargets:
     """Target loading should support streaming without loading all into memory."""

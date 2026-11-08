@@ -14,6 +14,7 @@ Features:
 from __future__ import annotations
 import argparse
 import concurrent.futures
+import csv
 import gc
 import re
 import threading
@@ -44,9 +45,13 @@ OK = "OK"
 ERROR = "ERROR"
 
 INDEX_PAT = re.compile(r'Index of /.git', re.IGNORECASE)
-GIT_HEAD_PAT = re.compile(r'ref:\s+refs/', re.IGNORECASE)
+# A real .git/HEAD is exactly a symbolic ref or a bare 40-hex object ID.
+# Anchored and whole-body: the previous r'[a-f0-9]{4,40}' search matched CSS
+# hex colours, webpack asset hashes and even the letters in "access".
+GIT_HEAD_VALID_PAT = re.compile(r'^(ref:\s*refs/\S+|[0-9a-f]{40})$', re.IGNORECASE)
 GIT_CONFIG_PAT = re.compile(r'\[core\]', re.IGNORECASE)
-SHA_PAT = re.compile(r'[a-f0-9]{4,40}', re.IGNORECASE)
+# objects/info/packs lines and pack directory listings name packs explicitly.
+PACK_NAME_PAT = re.compile(r'pack-[0-9a-f]{40}\.(pack|idx)', re.IGNORECASE)
 
 ANSI_RED = "\033[91m"  # Bright red
 ANSI_GREEN = "\033[92m"
@@ -77,28 +82,39 @@ progressLock = threading.Lock()  # rich.Progress is NOT thread-safe
 # Disk-backed dedup + rate limit (dnsx-inspired)
 # -------------------------
 class TokenBucket:
-    """Thread-safe token bucket for rate limiting."""
+    """Thread-safe token bucket for rate limiting.
+
+    Implemented as a reservation clock rather than a running token count:
+    each caller claims the next free slot under the lock, then sleeps until
+    that slot arrives with the lock released. Sleeping while holding the lock
+    both blocks unrelated workers and double-credits the waited-out interval
+    -- once by resetting the token count and again as elapsed time on the
+    next call -- which let the limiter run at several times the configured
+    rate. The clock is allowed to trail `per` seconds behind real time, which
+    preserves an initial burst of up to `rate` requests.
+    """
     def __init__(self, rate: int, per: float = 1.0):
         self.rate = max(rate, 1)
         self.per = per
-        self.tokens = float(rate)
-        self.last = time.monotonic()
+        self.interval = per / self.rate
         self.lock = threading.Lock()
+        # Trailing the clock by this much grants an opening burst of exactly
+        # `rate` requests; request rate+1 then waits one interval.
+        self.burstWindow = per - self.interval
+        self.nextFree = time.monotonic() - self.burstWindow
 
     def take(self):
         with self.lock:
             now = time.monotonic()
-            elapsed = now - self.last
-            self.last = now
-            self.tokens += elapsed * (self.rate / self.per)
-            if self.tokens > self.rate:
-                self.tokens = self.rate
-            if self.tokens < 1:
-                sleep_time = (1 - self.tokens) * (self.per / self.rate)
-                time.sleep(sleep_time)
-                self.tokens = 0
-            else:
-                self.tokens -= 1
+            earliest = now - self.burstWindow
+            if self.nextFree < earliest:
+                # Idle long enough that the backlog expired; re-anchor so the
+                # burst allowance does not accumulate without bound.
+                self.nextFree = earliest
+            wait = self.nextFree - now
+            self.nextFree += self.interval
+        if wait > 0:
+            time.sleep(wait)
 
 
 class DedupStore:
@@ -111,22 +127,39 @@ class DedupStore:
         self.conn.execute("CREATE TABLE IF NOT EXISTS seen(url TEXT PRIMARY KEY)")
         self.conn.commit()
         self._pending: List[str] = []
+        # Membership mirror of _pending. The list preserves insert order for
+        # the batched write; this answers has() in O(1) instead of scanning a
+        # buffer that can now outlive a failed flush.
+        self._pendingSet: Set[str] = set()
         self._lock = threading.Lock()
         self._last_flush = time.monotonic()
         self._flush_interval = flush_interval
         self._batch_size = batch_size
+        self._warned = False
+        # Cap on URLs held back for retry after failed writes. The .state file
+        # is written before dedup.add, so it stays the authoritative record and
+        # loadState can rebuild from it; this bound keeps a persistently broken
+        # database from growing the retry buffer without limit.
+        self._max_pending = max(batch_size * 100, batch_size)
 
     def has(self, url: str) -> bool:
         with self._lock:
-            if url in self._pending:
+            if url in self._pendingSet:
                 return True
+        # _maybe_flush takes the lock itself, so call it before re-acquiring.
         self._maybe_flush()
-        cur = self.conn.execute("SELECT 1 FROM seen WHERE url=?", (url,))
-        return cur.fetchone() is not None
+        with self._lock:
+            # One connection is shared by every worker thread. SQLite rejects
+            # concurrent use of a single connection with SQLITE_MISUSE ("bad
+            # parameter or other API misuse"), so every statement on it --
+            # reads included -- has to be serialized here, not just the writes.
+            cur = self.conn.execute("SELECT 1 FROM seen WHERE url=?", (url,))
+            return cur.fetchone() is not None
 
     def add(self, url: str):
         with self._lock:
             self._pending.append(url)
+            self._pendingSet.add(url)
             should_flush = (
                 len(self._pending) >= self._batch_size
                 or (time.monotonic() - self._last_flush) > self._flush_interval
@@ -139,6 +172,7 @@ class DedupStore:
             return
         with self._lock:
             self._pending.extend(urls)
+            self._pendingSet.update(urls)
         self._flush()
 
     def _maybe_flush(self):
@@ -160,9 +194,31 @@ class DedupStore:
                     [(u,) for u in self._pending]
                 )
                 self.conn.commit()
-            except Exception:
-                pass
+            except Exception as e:
+                # The write did not land, so the URLs are still unrecorded.
+                # Keep them for the next flush instead of dropping them, which
+                # would make a resumed scan re-probe targets it already hit.
+                if not self._warned:
+                    self._warned = True
+                    print(
+                        f"[WARN] dedup database write failed ({e}); "
+                        f"retaining {len(self._pending)} URLs for retry. "
+                        f"The .state file remains the authoritative record.",
+                        file=sys.stderr,
+                    )
+                if len(self._pending) > self._max_pending:
+                    dropped = len(self._pending) - self._max_pending
+                    del self._pending[:dropped]
+                    self._pendingSet = set(self._pending)
+                    print(
+                        f"[WARN] dedup retry buffer full; dropped {dropped} "
+                        f"URLs. Resume from the .state file instead.",
+                        file=sys.stderr,
+                    )
+                self._last_flush = time.monotonic()
+                return
             self._pending.clear()
+            self._pendingSet.clear()
             self._last_flush = time.monotonic()
 
     def close(self):
@@ -219,15 +275,15 @@ def loadState(stateFile: str, dedup: DedupStore) -> None:
         return
     urls: List[str] = []
     try:
-        with open(stateFile, "r", encoding="utf-8", errors="ignore") as fh:
-            for line in fh:
-                line = line.strip()
-                if not line:
+        with open(stateFile, "r", encoding="utf-8", errors="ignore", newline="") as fh:
+            for row in csv.reader(fh):
+                if len(row) < 3:
                     continue
-                parts = line.split(",", 2)
-                if len(parts) < 3:
-                    continue
-                url = parts[2].strip()
+                # The URL is always the last field. Reading it positionally from
+                # the end also recovers legacy rows written before the status
+                # message was quoted, where a comma in the message split it
+                # across several fields.
+                url = row[-1].strip()
                 if url:
                     urls.append(url)
     except Exception as e:
@@ -243,8 +299,11 @@ def appendState(stateFile: str, dedup: DedupStore, status: str, codeOrMsg: str, 
     """
     try:
         with stateLock:
-            with open(stateFile, "a", encoding="utf-8") as fh:
-                fh.write(f"{status},{codeOrMsg},{url}\n")
+            with open(stateFile, "a", encoding="utf-8", newline="") as fh:
+                # codeOrMsg carries str(exception) on the ERROR path, which
+                # routinely contains commas, quotes and newlines. csv quotes
+                # them so the URL stays in field 3 for loadState/writeFinalCsv.
+                csv.writer(fh, lineterminator="\n").writerow([status, codeOrMsg, url])
         dedup.add(url)
     except Exception as e:
         # we must not crash on state write failure
@@ -274,22 +333,46 @@ def _safeText(response: requests.Response, maxBytes: int = MAX_PROBE_BYTES) -> s
         return getattr(response, "text", "")[:maxBytes]
 
 
-def _contentTypeIsText(response: requests.Response) -> bool:
-    ct = response.headers.get("Content-Type", "")
-    return ct.startswith("text")
+def _contentTypeIsHtml(response: requests.Response) -> bool:
+    """True if the response is an HTML document.
+
+    A real .git/HEAD, .git/config or objects/info/packs is never HTML. Servers
+    that answer unknown paths with a 200 soft-404 page are the single largest
+    source of false positives, and this is what separates them.
+    """
+    ct = response.headers.get("Content-Type", "") or ""
+    return "html" in ct.lower()
 
 
-def checkGitExposure(session: requests.Session, baseUrl: str, timeout: float) -> Optional[Tuple[str, str, str, str]]:
+def checkGitExposure(session: requests.Session, baseUrl: str, timeout: float,
+                     limiter: Optional[TokenBucket] = None) -> Optional[Tuple[str, str, str, str]]:
     """
     Probe git endpoints. Return (STATUS_LABEL, STATUS_CODE_OR_MSG, baseUrl, serverHeader) or None.
-    Returns VULNERABLE for confirmed exposure, SUSPICIOUS for 200 with ambiguous content.
+
+    VULNERABLE means a response only a real .git directory produces.
+    SUSPICIOUS is reserved for a non-HTML 200 on .git/HEAD whose body is not
+    valid HEAD content -- genuinely ambiguous, worth a human look.
+
+    Redirects are never followed: a 3xx on these paths means the server is
+    routing the request somewhere else, not serving .git. Following them, and
+    accepting any hex-looking substring as an object ID, made every soft-404
+    page look like a finding.
+
+    Each request takes a token from *limiter* when one is supplied, so
+    --rate-limit bounds requests rather than targets.
     All requests are streamed and capped to MAX_PROBE_BYTES to avoid OOM on huge responses.
     """
     serverHeader = "N/A"
+
+    def get(path: str):
+        if limiter:
+            limiter.take()
+        return session.get(baseUrl + path, timeout=timeout,
+                           allow_redirects=False, stream=True)
+
     try:
-        # /.git/ directory listing
-        urlGitDir = baseUrl + "/.git/"
-        r = session.get(urlGitDir, timeout=timeout, allow_redirects=True, stream=True)
+        # /.git/ directory listing. This one is legitimately HTML.
+        r = get("/.git/")
         serverHeader = r.headers.get("Server", "N/A")
         if r.status_code == 200:
             text = _safeText(r, MAX_PROBE_BYTES)
@@ -298,41 +381,43 @@ def checkGitExposure(session: requests.Session, baseUrl: str, timeout: float) ->
         else:
             r.close()
 
-        # /.git/HEAD
-        urlHead = baseUrl + "/.git/HEAD"
-        r2 = session.get(urlHead, timeout=timeout, allow_redirects=True, stream=True)
+        # /.git/HEAD -- must be plain "ref: refs/..." or a bare 40-hex object ID
+        r2 = get("/.git/HEAD")
         if serverHeader == "N/A":
             serverHeader = r2.headers.get("Server", "N/A")
         if r2.status_code == 200:
+            isHtml = _contentTypeIsHtml(r2)
             body = _safeText(r2, MAX_PROBE_BYTES).strip()
-            if GIT_HEAD_PAT.search(body):
-                return (VULN, str(r2.status_code), baseUrl, serverHeader)
-            # Only mark as SUSPICIOUS if we got 200 with suspicious SHA-like content (but not confirmed)
-            if len(body) > 0 and SHA_PAT.search(body):
-                return (SUSPICIOUS, str(r2.status_code), baseUrl, serverHeader)
+            if not isHtml:
+                if GIT_HEAD_VALID_PAT.match(body):
+                    return (VULN, str(r2.status_code), baseUrl, serverHeader)
+                # Non-HTML 200 that is not valid HEAD content: ambiguous.
+                if body:
+                    return (SUSPICIOUS, str(r2.status_code), baseUrl, serverHeader)
         else:
             r2.close()
 
-        # /.git/config
-        urlConfig = baseUrl + "/.git/config"
-        r3 = session.get(urlConfig, timeout=timeout, allow_redirects=True, stream=True)
+        # /.git/config -- an INI file, never HTML
+        r3 = get("/.git/config")
         if serverHeader == "N/A":
             serverHeader = r3.headers.get("Server", "N/A")
-        if r3.status_code == 200 and GIT_CONFIG_PAT.search(_safeText(r3, MAX_PROBE_BYTES)):
-            return (VULN, str(r3.status_code), baseUrl, serverHeader)
+        if r3.status_code == 200:
+            isHtml = _contentTypeIsHtml(r3)
+            text = _safeText(r3, MAX_PROBE_BYTES)
+            if not isHtml and GIT_CONFIG_PAT.search(text):
+                return (VULN, str(r3.status_code), baseUrl, serverHeader)
         else:
             r3.close()
 
-        # objects/info/packs or objects/pack/
+        # objects/info/packs and objects/pack/ -- require a real pack filename
         for p in ("/.git/objects/info/packs", "/.git/objects/pack/"):
-            rp = session.get(baseUrl + p, timeout=timeout, allow_redirects=True, stream=True)
+            rp = get(p)
             if serverHeader == "N/A":
                 serverHeader = rp.headers.get("Server", "N/A")
-            # Only check for suspicious content if we got 200 OK
             if rp.status_code == 200:
                 text = _safeText(rp, MAX_PROBE_BYTES)
-                if "pack-" in text or _contentTypeIsText(rp):
-                    return (SUSPICIOUS, str(rp.status_code), baseUrl, serverHeader)
+                if PACK_NAME_PAT.search(text):
+                    return (VULN, str(rp.status_code), baseUrl, serverHeader)
             else:
                 rp.close()
 
@@ -346,14 +431,12 @@ def checkGitExposure(session: requests.Session, baseUrl: str, timeout: float) ->
     return (OK, str(getattr(r, "status_code", "N/A")), baseUrl, serverHeader)
 
 
-def worker(taskUrl: str, session: requests.Session, timeout: float, stateFile: str, dedup: DedupStore, limiter: Optional[TokenBucket] = None, dumpingExecutor: Optional[concurrent.futures.ThreadPoolExecutor] = None, outputDirArg: Optional[str] = None, progress: Optional[object] = None, scanTaskID: Optional[object] = None, displayQueue: Optional[Deque] = None, queueLock: Optional[object] = None, resolve: bool = False) -> None:
+def worker(taskUrl: str, session: requests.Session, timeout: float, stateFile: str, dedup: DedupStore, limiter: Optional[TokenBucket] = None, dumpingExecutor: Optional[concurrent.futures.ThreadPoolExecutor] = None, outputDirArg: Optional[str] = None, progress: Optional[object] = None, scanTaskID: Optional[object] = None, feed: Optional[FindingsFeed] = None, resolve: bool = False) -> None:
     """
     Worker that runs checkGitExposure and appends to state. Handles exceptions.
     Trigger dump if vulnerable and dumpingExecutor is provided.
     """
     global remaining, lastChecked
-    # Late import to ensure it's available or assume top-level import
-    from rich.panel import Panel
 
     result = None
     try:
@@ -367,10 +450,10 @@ def worker(taskUrl: str, session: requests.Session, timeout: float, stateFile: s
                     progress.advance(scanTaskID, 1)
             return
 
-        if limiter:
-            limiter.take()
-
-        result = checkGitExposure(session, taskUrl, timeout)
+        # The limiter is handed to checkGitExposure so each of its HTTP
+        # requests takes a token; throttling once per target let a scan run
+        # at up to 5x the configured rate.
+        result = checkGitExposure(session, taskUrl, timeout, limiter=limiter)
     except KeyboardInterrupt:
         import os
         os._exit(1)  # Worker exit
@@ -395,17 +478,16 @@ def worker(taskUrl: str, session: requests.Session, timeout: float, stateFile: s
                         pass
 
                 if dumpingExecutor:
-                    # Add row to queue instead of table
-                    if displayQueue is not None and queueLock is not None:
-                        with queueLock:
-                            displayQueue.append((
-                                f"[bold red]{status}[/bold red]",
-                                url,
-                                f"[blue]{ip_addr}[/blue]",
-                                f"[magenta]{serverHeader}[/magenta]",
-                                f"[dim white]{timeStr}[/dim white]",
-                                "[cyan]Dumping...[/cyan]"
-                            ))
+                    # Add row to the feed instead of the table
+                    if feed is not None:
+                        feed.append((
+                            f"[bold red]{status}[/bold red]",
+                            url,
+                            f"[blue]{ip_addr}[/blue]",
+                            f"[magenta]{serverHeader}[/magenta]",
+                            f"[dim white]{timeStr}[/dim white]",
+                            "[cyan]Dumping...[/cyan]"
+                        ))
                     else:
                         print(f"[VULNERABLE] {url} [Server: {serverHeader}] [DUMPING]")
 
@@ -470,16 +552,15 @@ def worker(taskUrl: str, session: requests.Session, timeout: float, stateFile: s
                             print(err_msg, file=sys.stderr)
                 else:
                     # No dumping, just alert
-                    if displayQueue is not None and queueLock is not None:
-                        with queueLock:
-                            displayQueue.append((
-                                f"[bold red]{status}[/bold red]",
-                                url,
-                                f"[blue]{ip_addr}[/blue]",
-                                f"[magenta]{serverHeader}[/magenta]",
-                                f"[dim white]{timeStr}[/dim white]",
-                                "[yellow]Logged[/yellow]"
-                            ))
+                    if feed is not None:
+                        feed.append((
+                            f"[bold red]{status}[/bold red]",
+                            url,
+                            f"[blue]{ip_addr}[/blue]",
+                            f"[magenta]{serverHeader}[/magenta]",
+                            f"[dim white]{timeStr}[/dim white]",
+                            "[yellow]Logged[/yellow]"
+                        ))
                     else:
                         print(f"{ANSI_RED}[{status}]{ANSI_RESET} {url}")
 
@@ -495,17 +576,16 @@ def worker(taskUrl: str, session: requests.Session, timeout: float, stateFile: s
 
                 timeStr = datetime.now().strftime("%H:%M:%S")
 
-                if displayQueue is not None and queueLock is not None:
-                    with queueLock:
-                        # Mapping: STATUS, URL, IP, SERVER, TIME, ACTION
-                        displayQueue.append((
-                            f"[bold yellow]{status}[/bold yellow]",
-                            url,
-                            f"[blue]{ip_addr}[/blue]",
-                            f"[magenta]{serverHeader}[/magenta]",
-                            f"[dim white]{timeStr}[/dim white]",
-                            f"[grey50]Status: {codeOrMsg}[/grey50]"
-                        ))
+                if feed is not None:
+                    # Mapping: STATUS, URL, IP, SERVER, TIME, ACTION
+                    feed.append((
+                        f"[bold yellow]{status}[/bold yellow]",
+                        url,
+                        f"[blue]{ip_addr}[/blue]",
+                        f"[magenta]{serverHeader}[/magenta]",
+                        f"[dim white]{timeStr}[/dim white]",
+                        f"[grey50]Status: {codeOrMsg}[/grey50]"
+                    ))
                 else:
                     print(f"{ANSI_GREEN}[{status}]{ANSI_RESET} {url}")
 
@@ -536,67 +616,6 @@ def worker(taskUrl: str, session: requests.Session, timeout: float, stateFile: s
 # -------------------------
 # Utilities
 # -------------------------
-def streamTargetsFromFile(path: str):
-    """Yield normalized targets from a file without loading all into memory."""
-    try:
-        with open(path, "r", encoding="utf-8", errors="ignore") as fh:
-            for line in fh:
-                u = normalizeUrl(line)
-                if u:
-                    yield u
-    except Exception as e:
-        print(f"[ERROR] Could not load input file {path}: {e}", file=sys.stderr)
-
-
-def loadTargetsFromFile(path: str) -> List[str]:
-    lst: List[str] = []
-    try:
-        with open(path, "r", encoding="utf-8", errors="ignore") as fh:
-            for line in fh:
-                u = normalizeUrl(line)
-                if u:
-                    lst.append(u)
-    except Exception as e:
-        print(f"[ERROR] Could not load input file {path}: {e}", file=sys.stderr)
-    return lst
-
-
-def boundedMap(func, iterable, maxWorkers=50, maxInflight=None):
-    """
-    Apply *func* to each item in *iterable* using a thread pool,
-    but keep the number of in-flight futures bounded to prevent
-    unbounded memory growth on huge inputs.
-    Yields results in completion order.
-    """
-    if maxInflight is None:
-        maxInflight = maxWorkers * 2
-
-    import concurrent.futures
-    from concurrent.futures import FIRST_COMPLETED
-
-    it = iter(iterable)
-    with concurrent.futures.ThreadPoolExecutor(max_workers=maxWorkers) as executor:
-        futures = set()
-        # Seed initial batch
-        for item in it:
-            futures.add(executor.submit(func, item))
-            if len(futures) >= maxInflight:
-                break
-
-        while futures:
-            done, futures = concurrent.futures.wait(
-                futures, return_when=FIRST_COMPLETED
-            )
-            for future in done:
-                yield future.result()
-            # Replenish
-            for _ in done:
-                try:
-                    futures.add(executor.submit(func, next(it)))
-                except StopIteration:
-                    break
-
-
 def writeFinalCsv(stateFile: str, outPrefix: str = "RepoXpose") -> None:
     """
     Reads the .state file and writes all entries into a CSV
@@ -611,34 +630,25 @@ def writeFinalCsv(stateFile: str, outPrefix: str = "RepoXpose") -> None:
         # Read the .state file to include all entries in the same order
         lines = []
         if os.path.exists(stateFile):
-            with open(stateFile, "r", encoding="utf-8", errors="ignore") as fh:
-                for line in fh:
-                    line = line.strip()
-                    if line:
-                        parts = line.split(",", 2)
-                        if len(parts) == 3:
-                            status, codeOrMsg, url = parts[0].strip(), parts[1].strip(), parts[2].strip()
-                            lines.append((status, codeOrMsg, url))
+            with open(stateFile, "r", encoding="utf-8", errors="ignore", newline="") as fh:
+                for row in csv.reader(fh):
+                    if len(row) < 3:
+                        continue
+                    # Status first, URL last. Anything between is the message,
+                    # which legacy unquoted rows may have split across fields.
+                    lines.append((
+                        row[0].strip(),
+                        ",".join(row[1:-1]),
+                        row[-1].strip(),
+                    ))
         # write csv header and rows
-        with open(filename, "w", encoding="utf-8") as csvf:
-            csvf.write("status,code_or_message,url\n")
-            for status, codeOrMsg, url in lines:
-                # escape commas in codeOrMsg if any by wrapping in quotes
-                if "," in codeOrMsg:
-                    codeOrMsg = '"' + codeOrMsg.replace('"', '""') + '"'
-                csvf.write(f"{status},{codeOrMsg},{url}\n")
+        with open(filename, "w", encoding="utf-8", newline="") as csvf:
+            writer = csv.writer(csvf, lineterminator="\n")
+            writer.writerow(["status", "code_or_message", "url"])
+            writer.writerows(lines)
         print(f"\nWrote final CSV report: {filename}")
     except Exception as e:
         print(f"\n[ERROR] Failed to write final CSV: {e}", file=sys.stderr)
-
-
-def count_lines(path: str) -> int:
-    """Fast line count for progress bar totals (reads in binary chunks)."""
-    count = 0
-    with open(path, "rb") as f:
-        for _ in f:
-            count += 1
-    return count
 
 
 def stream_targets(path: str, dedup: DedupStore):
@@ -648,6 +658,106 @@ def stream_targets(path: str, dedup: DedupStore):
             u = normalizeUrl(line)
             if u and not dedup.has(u):
                 yield u
+
+
+def countTargets(path: str, dedup: DedupStore, maxTargets: int = 0) -> int:
+    """Count the targets a scan will actually submit.
+
+    Applies the same filter as stream_targets -- blank lines, wildcard
+    patterns and already-seen URLs are all excluded -- so the progress bar
+    total matches the number of workers that will run. Counting raw lines
+    instead leaves the bar stuck short of 100%.
+    """
+    count = 0
+    try:
+        with open(path, "r", encoding="utf-8", errors="ignore") as fh:
+            for line in fh:
+                u = normalizeUrl(line)
+                if u and not dedup.has(u):
+                    count += 1
+                    if maxTargets and count >= maxTargets:
+                        break
+    except OSError as e:
+        print(f"[ERROR] Could not read input file {path}: {e}", file=sys.stderr)
+        return 0
+    return count
+
+
+# -------------------------
+# Live dashboard
+# -------------------------
+# STATUS, TARGET URL, IP ADDRESS, SERVER, TIME, ACTION
+FINDINGS_COLUMNS = 6
+
+
+IP_FIELD_INDEX = 2
+
+
+class FindingsFeed:
+    """Bounded, thread-safe feed of findings for the live dashboard.
+
+    Owns its own lock and a monotonic revision counter. The renderer
+    throttles redraws and needs to know that new findings arrived; the
+    window's length is not that signal, because a bounded deque stops
+    growing once full, which froze the dashboard on the 10th finding.
+    """
+
+    def __init__(self, maxlen: int = 10):
+        self._rows: Deque[Tuple] = collections.deque(maxlen=maxlen)
+        self._lock = threading.Lock()
+        self._revision = 0
+
+    def append(self, row: Tuple) -> None:
+        with self._lock:
+            self._rows.append(row)
+            self._revision += 1
+
+    @property
+    def revision(self) -> int:
+        with self._lock:
+            return self._revision
+
+    def snapshot(self) -> List[Tuple]:
+        """Return a copy, so rendering never races an append."""
+        with self._lock:
+            return list(self._rows)
+
+
+def buildFindingsTable(rows, showIp: bool = False) -> "object":
+    """Build the findings table for the live dashboard.
+
+    Five fixed-width columns plus borders already exceed an 80-column
+    terminal, so TARGET URL -- sized only by ratio -- used to be squeezed to
+    zero width, hiding the one field the operator cannot reconstruct from the
+    others. TARGET URL now gets a min_width floor, the secondary columns can
+    shrink, and IP ADDRESS is omitted unless --resolve actually populated it
+    (otherwise it is 15 columns of "N/A").
+    """
+    from rich.table import Table
+    from rich.box import HEAVY_EDGE
+
+    table = Table(
+        box=HEAVY_EDGE,
+        show_header=True,
+        header_style="bold white on blue",
+        title="[bold reverse cyan] TARGET EXPOSURE SYSTEMS [/bold reverse cyan]",
+        expand=True,
+        border_style="bright_blue",
+        row_styles=["", "dim"],
+    )
+    table.add_column("STATUS", justify="center", min_width=10, style="bold", no_wrap=True)
+    table.add_column("TARGET URL", style="cyan", ratio=1, min_width=24, overflow="fold")
+    if showIp:
+        table.add_column("IP ADDRESS", style="blue", min_width=11, justify="center", no_wrap=True)
+    table.add_column("SERVER", style="magenta", min_width=8, max_width=20, overflow="ellipsis", no_wrap=True)
+    table.add_column("TIME", style="dim white", min_width=8, justify="center", no_wrap=True)
+    table.add_column("ACTION", style="grey70", min_width=8, max_width=15, justify="center", overflow="ellipsis", no_wrap=True)
+
+    for row in rows:
+        if not showIp and len(row) > IP_FIELD_INDEX:
+            row = row[:IP_FIELD_INDEX] + row[IP_FIELD_INDEX + 1:]
+        table.add_row(*row)
+    return table
 
 
 # -------------------------
@@ -702,7 +812,9 @@ def main(argv: Optional[List[str]] = None) -> int:
         targetIter = iter([u])
         totalLines = 1
     else:
-        totalLines = count_lines(args.input)
+        # Count what will actually be submitted, not raw lines: blanks,
+        # wildcards and resumed URLs are filtered out by stream_targets.
+        totalLines = countTargets(args.input, dedup, maxTargets=max(args.max, 0))
         targetIter = stream_targets(args.input, dedup)
         if args.max and args.max > 0:
             targetIter = itertools.islice(targetIter, args.max)
@@ -727,32 +839,13 @@ def main(argv: Optional[List[str]] = None) -> int:
         pass
 
     # run thread pool
-    from rich.progress import Progress, SpinnerColumn, BarColumn, TextColumn, TimeRemainingColumn, TransferSpeedColumn, MofNCompleteColumn
-    from rich.console import Console
+    from rich.progress import Progress, SpinnerColumn, BarColumn, TextColumn, TimeRemainingColumn, MofNCompleteColumn
     from rich.panel import Panel
-    from rich.table import Table
     from rich.live import Live
     from rich.console import Group
-    from rich.box import HEAVY_EDGE
 
-    # 1. Create the Findings Table
-    findingsTable = Table(
-        box=HEAVY_EDGE,
-        show_header=True,
-        header_style="bold white on blue",
-        title="[bold reverse cyan] TARGET EXPOSURE SYSTEMS [/bold reverse cyan]",
-        expand=True,
-        border_style="bright_blue",
-        row_styles=["", "dim"]
-    )
-    findingsTable.add_column("STATUS", justify="center", width=12, style="bold")
-    findingsTable.add_column("TARGET URL", style="cyan")
-    findingsTable.add_column("SERVER", style="magenta")
-    findingsTable.add_column("TIME", style="dim white")
-    findingsTable.add_column("ACTION", style="grey70")
-
-    # Lock for table updates
-    tableLock = threading.Lock()
+    # 1. Findings feed, rendered by buildFindingsTable
+    feed = FindingsFeed(maxlen=10)
 
     # 2. Create Progress Bar
     progress = Progress(
@@ -767,7 +860,7 @@ def main(argv: Optional[List[str]] = None) -> int:
 
     # 3. Create Group and Live View
     ui_group = Group(
-        Panel(findingsTable, border_style="cyan"),
+        Panel(buildFindingsTable(feed.snapshot(), showIp=args.resolve), border_style="cyan"),
         progress
     )
 
@@ -787,35 +880,14 @@ def main(argv: Optional[List[str]] = None) -> int:
 
         futures = set()
         try:
-            # Fixed-size queue for sliding window effect
-            displayQueue: Deque[Tuple] = collections.deque(maxlen=10)
-            queueLock = threading.Lock()
-
-            # Helper to rebuild table
-            def rebuildTable(queue):
-                newTable = Table(
-                    box=HEAVY_EDGE,
-                    show_header=True,
-                    header_style="bold white on blue",
-                    title="[bold reverse cyan] TARGET EXPOSURE SYSTEMS [/bold reverse cyan]",
-                    expand=True,
-                    border_style="bright_blue",
-                    row_styles=["", "dim"]
-                )
-                newTable.add_column("STATUS", justify="center", width=12, style="bold", no_wrap=True)
-                newTable.add_column("TARGET URL", style="cyan", ratio=1, overflow="fold")
-                newTable.add_column("IP ADDRESS", style="blue", width=15, justify="center")
-                newTable.add_column("SERVER", style="magenta", width=20, overflow="ellipsis", no_wrap=True)
-                newTable.add_column("TIME", style="dim white", width=10, justify="center", no_wrap=True)
-                newTable.add_column("ACTION", style="grey70", width=15, justify="center", no_wrap=True)
-
-                with queueLock:
-                    for row in queue:
-                        if len(row) == 4:
-                             newTable.add_row(*row)
-                        else:
-                             newTable.add_row(*row)
-                return newTable
+            def renderFindings():
+                live.update(Group(
+                    Panel(
+                        buildFindingsTable(feed.snapshot(), showIp=args.resolve),
+                        border_style="cyan",
+                    ),
+                    progress,
+                ))
 
             maxInflight = args.threads * 2
 
@@ -835,15 +907,16 @@ def main(argv: Optional[List[str]] = None) -> int:
                         args.output_dir,
                         progress,
                         scanTaskID,
-                        displayQueue,
-                        queueLock,
+                        feed,
                         args.resolve
                     ))
                 except StopIteration:
                     break
 
-            # Track queue length to avoid unnecessary table rebuilds
-            lastQueueLen = 0
+            # Track the feed's revision to avoid unnecessary table rebuilds.
+            # Revision, not length: the window is bounded, so its length stops
+            # changing once full and findings would stop being drawn.
+            lastRevision = 0
             lastTableRebuild = 0.0
             TABLE_REBUILD_INTERVAL = 1.0  # seconds
 
@@ -872,28 +945,27 @@ def main(argv: Optional[List[str]] = None) -> int:
                             args.output_dir,
                             progress,
                             scanTaskID,
-                            displayQueue,
-                            queueLock,
+                            feed,
                             args.resolve
                         ))
                     except StopIteration:
                         break
 
                 # Rebuild table only when new rows arrived AND throttled interval elapsed
-                currentQueueLen = len(displayQueue)
-                now = time.time()
-                if currentQueueLen != lastQueueLen and (now - lastTableRebuild) >= TABLE_REBUILD_INTERVAL:
-                    lastQueueLen = currentQueueLen
+                currentRevision = feed.revision
+                now = time.monotonic()
+                if currentRevision != lastRevision and (now - lastTableRebuild) >= TABLE_REBUILD_INTERVAL:
+                    lastRevision = currentRevision
                     lastTableRebuild = now
-                    live.update(Group(
-                        Panel(rebuildTable(displayQueue), border_style="cyan"),
-                        progress
-                    ))
+                    renderFindings()
                     # Force GC to reclaim old Rich Table/Panel objects and prevent memory creep
                     gc.collect()
 
-            if args.dump and dumpingExecutor:
-                pass
+            # Final render: without it, any finding arriving inside the last
+            # throttle window never reaches the screen.
+            if feed.revision != lastRevision:
+                lastRevision = feed.revision
+                renderFindings()
 
             # Clean shutdown (non-interrupt case)
             if args.dump and dumpingExecutor:
@@ -921,6 +993,10 @@ def main(argv: Optional[List[str]] = None) -> int:
             os._exit(2)
 
     print("\nScan complete.")
+    # The default state file is timestamped, so a bare restart begins a fresh
+    # scan rather than resuming. Name the file the operator has to pass to
+    # actually pick this run back up.
+    print(f"Resume this scan with: --state-file {args.state_file}")
     if args.csv:
         writeFinalCsv(args.state_file)
     dedup.close()
@@ -930,7 +1006,7 @@ def main(argv: Optional[List[str]] = None) -> int:
 if __name__ == "__main__":
     try:
         raise SystemExit(main())
-    except SystemExit as se:
+    except SystemExit:
         # allow normal exits
         raise
     except Exception as e:

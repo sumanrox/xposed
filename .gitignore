@@ -10,6 +10,8 @@ venv/
 
 # Tool Specific
 *.state
+.state_*
+*.db
 *.csv
 *-xposed-*/
 
@@ -25,3 +27,6 @@ Thumbs.db
 # IDEs
 .vscode/
 .idea/
+
+# Browser automation artifacts
+.playwright-mcp/

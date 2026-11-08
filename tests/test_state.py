@@ -104,13 +104,13 @@ class TestAppendState:
 class TestWriteFinalCsv:
     """CSV export should include all state entries."""
 
-    def test_writes_csv_from_state(self, tmp_path):
+    def test_writes_csv_from_state(self, tmp_path, monkeypatch):
         stateFile = str(tmp_path / "csv.state")
         with open(stateFile, "w") as f:
             f.write("VULNERABLE,200,https://victim.com\n")
             f.write("OK,404,https://safe.com\n")
 
-        os.chdir(tmp_path)
+        monkeypatch.chdir(tmp_path)
         import xposedRepo
         orig_month_map = xposedRepo.MONTH_MAP.copy()
         try:
@@ -126,4 +126,139 @@ class TestWriteFinalCsv:
             assert "OK,404,https://safe.com" in content
         finally:
             xposedRepo.MONTH_MAP = orig_month_map
-            os.chdir("/home/spectre/Hacking/01-Tools/testing/dnsx/xposed")
+
+
+class TestStateRoundTripWithCommas:
+    """Field 2 carries str(exception), which routinely contains commas.
+    The URL must survive a write -> reload -> CSV round trip regardless."""
+
+    def test_url_survives_reload_when_message_has_commas(self, tmp_path, fresh_dedup):
+        stateFile = str(tmp_path / "commas.state")
+        open(stateFile, "a").close()
+        msg = ("HTTPSConnectionPool(host='127.0.0.1', port=9999): "
+               "Max retries exceeded with url: /.git/, giving up")
+        appendState(stateFile, fresh_dedup, ERROR, msg, "https://target.com")
+
+        reloaded = DedupStore(db_path=str(tmp_path / "reload.db"))
+        loadState(stateFile, reloaded)
+        try:
+            assert reloaded.has("https://target.com") is True
+        finally:
+            reloaded.close()
+
+    def test_csv_keeps_url_in_url_column_when_message_has_commas(self, tmp_path, fresh_dedup, monkeypatch):
+        import csv
+        stateFile = str(tmp_path / "csv_commas.state")
+        open(stateFile, "a").close()
+        msg = "connection aborted, remote end closed, retrying"
+        appendState(stateFile, fresh_dedup, ERROR, msg, "https://target.com")
+
+        monkeypatch.chdir(tmp_path)
+        writeFinalCsv(stateFile, outPrefix="Commas")
+        csvPath = [f for f in os.listdir(tmp_path) if f.endswith("-Commas.csv")][0]
+        with open(csvPath, newline="") as f:
+            rows = list(csv.reader(f))
+
+        assert rows[0] == ["status", "code_or_message", "url"]
+        assert rows[1] == [ERROR, msg, "https://target.com"]
+
+
+class FlakyConn:
+    """Wraps a sqlite connection and fails the first *failTimes* writes."""
+
+    def __init__(self, real, failTimes):
+        self._real = real
+        self._failTimes = failTimes
+
+    def executemany(self, *args, **kwargs):
+        if self._failTimes > 0:
+            self._failTimes -= 1
+            import sqlite3
+            raise sqlite3.OperationalError("database is locked")
+        return self._real.executemany(*args, **kwargs)
+
+    def __getattr__(self, name):
+        return getattr(self._real, name)
+
+
+class TestDedupStoreFlushFailure:
+    """A failed write must not be mistaken for a completed one."""
+
+    def test_retains_urls_when_a_flush_fails(self, tmp_path):
+        dbPath = str(tmp_path / "flush.db")
+        d = DedupStore(db_path=dbPath, batch_size=1)
+        real = d.conn
+        d.conn = FlakyConn(real, failTimes=1)
+        d.add("https://victim.com")   # this flush fails
+        d.conn = real                 # database healthy again
+        d.close()                     # final flush must retry the URL
+
+        reopened = DedupStore(db_path=dbPath)
+        try:
+            assert reopened.has("https://victim.com") is True
+        finally:
+            reopened.close()
+
+    def test_warns_instead_of_failing_silently(self, tmp_path, capsys):
+        d = DedupStore(db_path=str(tmp_path / "warn.db"), batch_size=1)
+        real = d.conn
+        d.conn = FlakyConn(real, failTimes=1)
+        d.add("https://victim.com")
+        d.conn = real
+        d.close()
+
+        assert "dedup" in capsys.readouterr().err.lower()
+
+
+class TestDedupStoreConcurrency:
+    """The scanner drives one DedupStore from every worker thread, so the
+    store must tolerate concurrent has()/add() without SQLite misuse."""
+
+    def _hammer(self, store, nthreads=20, perThread=400):
+        import threading
+        errors = []
+        errorsLock = threading.Lock()
+
+        def worker(n):
+            try:
+                for i in range(perThread):
+                    url = f"https://host{n}-{i}.example"
+                    if not store.has(url):
+                        store.add(url)
+            except BaseException as e:
+                with errorsLock:
+                    errors.append(f"{type(e).__name__}: {e}")
+
+        threads = [threading.Thread(target=worker, args=(n,)) for n in range(nthreads)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+        return errors
+
+    def test_concurrent_has_and_add_do_not_raise(self, tmp_path):
+        store = DedupStore(db_path=str(tmp_path / "race.db"), batch_size=50)
+        try:
+            errors = self._hammer(store)
+        finally:
+            store.close()
+        assert errors == [], f"{len(errors)} worker(s) failed: {errors[:3]}"
+
+    def test_every_concurrently_added_url_is_recorded(self, tmp_path):
+        dbPath = str(tmp_path / "race_persist.db")
+        store = DedupStore(db_path=dbPath, batch_size=50)
+        try:
+            assert self._hammer(store, nthreads=8, perThread=100) == []
+        finally:
+            store.close()
+
+        reopened = DedupStore(db_path=dbPath)
+        try:
+            missing = [
+                f"https://host{n}-{i}.example"
+                for n in range(8) for i in range(100)
+                if not reopened.has(f"https://host{n}-{i}.example")
+            ]
+        finally:
+            reopened.close()
+        assert missing == [], f"{len(missing)} URLs lost, e.g. {missing[:3]}"

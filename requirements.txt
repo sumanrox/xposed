@@ -1,6 +1,10 @@
 requests==2.32.5
 rich
-dulwich
+# dulwich >=1.0.0: PackData() and load_pack_index() gained a required
+# object_format argument in 1.0.0. modules/dumper.py passes it, so 0.22.x
+# and earlier raise TypeError -- silently, since the pack enumeration
+# swallows exceptions.
+dulwich>=1.0.0
 beautifulsoup4
 urllib3
 PySocks

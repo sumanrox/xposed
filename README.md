@@ -15,12 +15,12 @@
     *   **STATUS**: `VULNERABLE` (Red) / `SUSPICIOUS` (Yellow)
     *   **SERVER**: `nginx`, `Apache`, `Cloudflare` (Magenta)
     *   **TIME**: Discovery timestamp (Dim White)
-*   **Clean Exit**: Graceful shutdown on `Ctrl+C` without terminal artifacts.
+*   **Clean Exit**: `Ctrl+C` exits immediately without leaving terminal artifacts. Results already written to the `.state` file are kept; in-flight probes and dumps are abandoned.
 
 ### ⚡ **High-Performance Scanning**
 *   **Parallel Execution**: Scans hundreds of targets concurrently (default: 50 threads).
-*   **Resumable**: Progress is saved to `.state` file immediately. Restarting resumes where you left off.
-*   **Smart Detection**: Checks `/.git/`, `HEAD`, `config`, and Pack files for accurate validation.
+*   **Resumable**: Progress is saved to the `.state` file immediately. The default state file is timestamped per run, so pass `--state-file <file>` to resume a previous scan (the path is printed when a scan ends).
+*   **Smart Detection**: Checks `/.git/`, `HEAD`, `config` and pack files. Redirects are not followed, HTML responses are rejected on paths that are never HTML, and `HEAD` must contain a real symbolic ref or a bare 40-hex object ID -- so 200-status "soft 404" pages are not reported as findings.
 
 ### 📦 **Auto-Dump Integration**
 *   **--dump**: Automatically triggers the standard `git-dumper` logic for vulnerable targets.
@@ -78,6 +78,11 @@ python3 xposedRepo.py -i targets.txt -t 100 --timeout 10 --state-file operation_
 | `-t / --threads` | Number of worker threads | 50 |
 | `-T / --timeout` | Request timeout (seconds) | 5 |
 | `--output-dir` | Directory to save dumps | `./<domain>-xposed-<time>` |
+| `--csv` | Write a CSV report when the scan finishes | False |
+| `--rate-limit` | Cap HTTP requests per second across all workers (0 = unlimited). Each target costs up to 5 requests. | 0 |
+| `--resolve` | Resolve IPs for findings and show the IP column | False |
+| `--state-file` | State file to resume from | `.state_<timestamp>` |
+| `--max` | Stop after N targets from the input file | 0 (all) |
 
 ---
 
@@ -90,7 +95,9 @@ A heavy-duty terminal UI showing:
 *   **Action**: `Dumping...` or `Logged`
 
 ### 2. CSV Report
-Final results are saved to a CSV file (e.g., `28-Dec-2025-xposedRepo.csv`).
+With `--csv`, results are written to a CSV file (e.g., `28-Dec-2025-RepoXpose.csv`).
+Fields containing commas or quotes are properly quoted, so the `url` column is
+always the third field.
 ```csv
 status,code_or_message,url
 VULNERABLE,200,https://victim.com

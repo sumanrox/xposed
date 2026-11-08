@@ -80,3 +80,107 @@ class TestStreamTargets:
         urls = list(stream_targets(str(f), dedup))
         assert urls == []
         dedup.close()
+
+
+class TestCountTargets:
+    """The progress bar total must match what stream_targets actually yields,
+    or the scan can never reach 100%."""
+
+    def _write(self, tmp_path):
+        f = tmp_path / "targets.txt"
+        f.write_text(
+            "example.com\n"        # counts
+            "\n"                   # blank, normalizeUrl rejects
+            "*.wild.com\n"         # wildcard, normalizeUrl rejects
+            "https://seen.com\n"   # already in dedup, stream_targets skips
+            "   \n"                # whitespace only, rejected
+            "http://new.dev\n"     # counts
+        )
+        return f
+
+    def test_count_matches_what_stream_targets_yields(self, tmp_path):
+        from xposedRepo import countTargets
+        f = self._write(tmp_path)
+        dedup = DedupStore(db_path=str(tmp_path / "dedup.db"))
+        dedup.add("https://seen.com")
+        try:
+            yielded = list(stream_targets(str(f), dedup))
+            assert countTargets(str(f), dedup) == len(yielded) == 2
+        finally:
+            dedup.close()
+
+    def test_count_honors_max_cap(self, tmp_path):
+        from xposedRepo import countTargets
+        f = self._write(tmp_path)
+        dedup = DedupStore(db_path=str(tmp_path / "dedup2.db"))
+        try:
+            assert countTargets(str(f), dedup, maxTargets=1) == 1
+        finally:
+            dedup.close()
+
+    def test_count_is_zero_for_missing_file(self, tmp_path):
+        from xposedRepo import countTargets
+        dedup = DedupStore(db_path=str(tmp_path / "dedup3.db"))
+        try:
+            assert countTargets(str(tmp_path / "nope.txt"), dedup) == 0
+        finally:
+            dedup.close()
+
+
+class TestTokenBucketRateCeiling:
+    """--rate-limit is a ceiling on requests sent to third-party targets.
+    Exceeding it is a scope-compliance problem, not a performance nit."""
+
+    def test_sustained_rate_does_not_exceed_configured_limit(self):
+        rate = 20
+        takes = 40
+        tb = TokenBucket(rate=rate)
+        start = time.monotonic()
+        for _ in range(takes):
+            tb.take()
+        elapsed = time.monotonic() - start
+        # An initial burst of `rate` is free; the rest must be paced.
+        floor = ((takes - rate) / rate) * 0.9
+        assert elapsed >= floor, (
+            f"{takes} takes at rate={rate} finished in {elapsed:.3f}s "
+            f"(effective {takes / elapsed:.1f}/s), expected >= {floor:.3f}s"
+        )
+
+    def test_rate_ceiling_holds_under_thread_contention(self):
+        rate = 20
+        tb = TokenBucket(rate=rate)
+        perThread, nthreads = 5, 8
+        takes = perThread * nthreads
+        start = time.monotonic()
+
+        def worker():
+            for _ in range(perThread):
+                tb.take()
+
+        threads = [threading.Thread(target=worker) for _ in range(nthreads)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+        elapsed = time.monotonic() - start
+        floor = ((takes - rate) / rate) * 0.9
+        assert elapsed >= floor, (
+            f"{takes} takes across {nthreads} threads at rate={rate} finished "
+            f"in {elapsed:.3f}s (effective {takes / elapsed:.1f}/s)"
+        )
+
+    def test_does_not_hold_the_lock_while_sleeping(self):
+        tb = TokenBucket(rate=2)
+        for _ in range(2):
+            tb.take()           # drain the initial burst
+
+        sleeping = threading.Thread(target=tb.take)
+        sleeping.start()
+        time.sleep(0.1)         # the thread is now inside a throttled sleep
+        try:
+            acquired = tb.lock.acquire(blocking=False)
+            if acquired:
+                tb.lock.release()
+        finally:
+            sleeping.join()
+        assert acquired is True, "lock held across time.sleep blocks other workers"

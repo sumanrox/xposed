@@ -5,14 +5,12 @@ import threading
 import os
 import os.path
 import re
-import socket
 import subprocess
-import sys
-import traceback
 import urllib.parse
 import urllib3
 import bs4
 import dulwich.index
+import dulwich.object_format
 import dulwich.objects
 import dulwich.pack
 import dulwich.repo
@@ -325,17 +323,172 @@ class FindObjectsWorker(DownloadWorker):
         except Exception:
             return []
 
+def ensureGitLayout(directory):
+    """ Create the directories git requires to recognize *directory* as a repo.
+
+    git's repository discovery insists that .git/refs and .git/objects exist
+    as directories, even when empty. The dumper only creates a directory as a
+    side effect of fetching a path inside it, so a target whose refs are all
+    packed into .git/packed-refs leaves .git/refs absent -- and then every git
+    command on the dump fails with "fatal: not a git repository", including
+    the `git checkout` that materializes the working tree. `git gc` packs refs
+    automatically, so this is the common case on a real server, not an edge
+    case. Existing contents are left untouched.
+    """
+    for subdir in ("refs", "objects"):
+        try:
+            os.makedirs(os.path.join(directory, ".git", subdir), exist_ok=True)
+        except OSError:
+            pass
+
+
+def collectPackedObjects(directory):
+    """ Enumerate objects carried by the pack files already fetched into
+    *directory*.
+
+    Returns a (packedObjs, referencedObjs) tuple of hex SHA1 sets:
+      - packedObjs:     objects the packs already contain, so they need no fetch
+      - referencedObjs: objects the packed objects point at, which may still
+                        be missing and therefore have to be fetched
+
+    A damaged or truncated pack is skipped rather than aborting the dump.
+    """
+    packedObjs = set()
+    referencedObjs = set()
+
+    packFileDir = os.path.join(directory, ".git", "objects", "pack")
+    if not os.path.isdir(packFileDir):
+        return packedObjs, referencedObjs
+
+    for filename in os.listdir(packFileDir):
+        if filename.startswith("pack-") and filename.endswith(".pack"):
+            try:
+                packDataPath = os.path.join(packFileDir, filename)
+                packIdxPath = os.path.join(
+                    packFileDir, filename[:-5] + ".idx"
+                )
+                objectFormat = dulwich.object_format.get_object_format()
+                packData = dulwich.pack.PackData(packDataPath, objectFormat)
+                packIdx = dulwich.pack.load_pack_index(packIdxPath, objectFormat)
+                pack = dulwich.pack.Pack.from_objects(packData, packIdx)
+                for objFile in pack.iterobjects():
+                    packedObjs.add(objFile.sha().hexdigest())
+                    referencedObjs |= set(getReferencedSha1(objFile))
+            except Exception:
+                pass
+
+    return packedObjs, referencedObjs
+
+# Entries kept active in a dumped .git/config, as (section, key) pairs.
+# Everything else is commented out.
+#
+# This is an allowlist on purpose. The dumped config comes from the scanned
+# target and `git checkout` reads it, and git turns a lot of config into
+# subprocesses: core.fsmonitor, core.hooksPath, core.sshCommand, core.pager,
+# core.editor, core.askpass, core.gitProxy, credential.helper, gpg.program,
+# alias.*, diff.*.textconv, uploadpack.packObjectsHook and -- the one that
+# fires on a plain `git checkout .` -- filter.*.smudge, driven by the
+# .gitattributes the same target supplied. Enumerating those is a losing
+# game; a denylist is only ever as good as the last advisory. With an
+# allowlist, a key nobody thought of is inert by default.
+#
+# These are the keys `git checkout` needs to read the repository, and none of
+# them is a command.
+SAFE_CONFIG_ENTRIES = frozenset({
+    ("core", "repositoryformatversion"),
+    ("core", "filemode"),
+    ("core", "bare"),
+    ("core", "logallrefupdates"),
+    ("core", "symlinks"),
+    ("core", "ignorecase"),
+    ("core", "precomposeunicode"),
+    ("extensions", "objectformat"),
+})
+
+_CONFIG_SECTION_RE = re.compile(r'^\[\s*([A-Za-z0-9.-]+)(?:\s+"((?:[^"\\]|\\.)*)")?\s*\]')
+_CONFIG_KEY_RE = re.compile(r'^([A-Za-z][A-Za-z0-9-]*)\s*(?:=\s*(.*))?$')
+_SANITIZED_MARKER = "# --- sanitized by xposedRepo:"
+
+
+def sanitizeConfigText(text):
+    """Rebuild a .git/config keeping only SAFE_CONFIG_ENTRIES active.
+
+    Returns the sanitized text. The original is appended as comments so the
+    operator keeps the remote URL and anything else of intelligence value
+    without git ever acting on it.
+    """
+    if _SANITIZED_MARKER in text:
+        return text  # already sanitized; keep idempotent
+
+    kept = []           # [(section, key, value)] in file order
+    section = None
+    continuing = False
+
+    for raw in text.splitlines():
+        if continuing:
+            # Part of a previous value; never a key of its own.
+            continuing = raw.rstrip().endswith("\\")
+            continue
+
+        line = raw.strip()
+        if not line or line[0] in "#;":
+            continue
+
+        match = _CONFIG_SECTION_RE.match(line)
+        if match:
+            section = match.group(1).lower()
+            rest = line[match.end():].strip()
+            if not rest or rest[0] in "#;":
+                continue
+            line = rest  # git allows the first variable on the header line
+
+        keyMatch = _CONFIG_KEY_RE.match(line)
+        if not keyMatch or section is None:
+            continue
+
+        key = keyMatch.group(1).lower()
+        value = (keyMatch.group(2) or "true").strip()
+        if value.endswith("\\"):
+            # Multi-line value. Never keep one: the continuation lines are not
+            # re-examined, so a kept value could smuggle in further content.
+            continuing = True
+            continue
+        if (section, key) in SAFE_CONFIG_ENTRIES:
+            kept.append((section, key, value))
+
+    out = []
+    lastSection = None
+    for sect, key, value in kept:
+        if sect != lastSection:
+            out.append("[%s]" % sect)
+            lastSection = sect
+        out.append("\t%s = %s" % (key, value))
+
+    out.append("")
+    out.append("%s only the keys git needs to read this repository are active."
+               % _SANITIZED_MARKER)
+    out.append("# The target's original config follows, inert, for reference.")
+    for raw in text.splitlines():
+        out.append("# " + raw)
+    out.append("")
+    return "\n".join(out)
+
+
 def sanitizeFile(filepath):
-    """ Inplace comment out possibly unsafe lines based on regex """
+    """ Neutralize a dumped .git/config before any git command reads it """
     if not os.path.isfile(filepath):
         return
-    UNSAFE=r"^\s*fsmonitor|sshcommand|askpass|editor|pager"
-    with open(filepath, 'r+') as f:
-        content = f.read()
-        modifiedContent = re.sub(UNSAFE, r'# \g<0>', content, flags=re.IGNORECASE)
-        if content != modifiedContent:
-            f.seek(0)
-            f.write(modifiedContent)
+    try:
+        with open(filepath, "r", encoding="utf-8", errors="replace") as f:
+            original = f.read()
+    except OSError:
+        return
+    sanitized = sanitizeConfigText(original)
+    if sanitized != original:
+        # Rewrite rather than seek(0)+write: the result can be shorter than
+        # the original, which would otherwise leave trailing bytes behind.
+        with open(filepath, "w", encoding="utf-8") as f:
+            f.write(sanitized)
 
 def fetchGit(url, directory, jobs, retry, timeout, httpHeaders, clientCertP12=None, clientCertP12Password=None, progressCallback=None):
     """ Dump a git repository into the output directory """
@@ -373,6 +526,10 @@ def fetchGit(url, directory, jobs, retry, timeout, httpHeaders, clientCertP12=No
             return 1
     except Exception:
         return 1
+
+    # The target is a real repository, so make the dump look like one before
+    # any git command runs against it.
+    ensureGitLayout(directory)
 
     # set up environment to ensure proxy usage
     environment = os.environ.copy()
@@ -561,23 +718,9 @@ def fetchGit(url, directory, jobs, retry, timeout, httpHeaders, clientCertP12=No
         except Exception:
             pass
 
-    packFileDir = os.path.join(directory, ".git", "objects", "pack")
-    if os.path.isdir(packFileDir):
-        for filename in os.listdir(packFileDir):
-            if filename.startswith("pack-") and filename.endswith(".pack"):
-                try:
-                    packDataPath = os.path.join(packFileDir, filename)
-                    packIdxPath = os.path.join(
-                        packFileDir, filename[:-5] + ".idx"
-                    )
-                    packData = dulwich.pack.PackData(packDataPath)
-                    packIdx = dulwich.pack.load_pack_index(packIdxPath)
-                    pack = dulwich.pack.Pack.from_objects(packData, packIdx)
-                    for objFile in pack.iterobjects():
-                        packedObjs.add(objFile.sha().hexdigest())
-                        objs |= set(getReferencedSha1(objFile))
-                except Exception:
-                    pass
+    foundPacked, foundReferenced = collectPackedObjects(directory)
+    packedObjs |= foundPacked
+    objs |= foundReferenced
 
     # fetch all objects
     processTasks(
